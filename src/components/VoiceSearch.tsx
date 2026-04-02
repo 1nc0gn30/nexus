@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Mic, ShieldAlert, ShieldCheck } from 'lucide-react';
+import { Mic } from 'lucide-react';
 import { cn } from '@/src/lib/utils';
 
 interface VoiceSearchProps {
@@ -124,8 +124,19 @@ export const VoiceSearch: React.FC<VoiceSearchProps> = ({ onTranscript, classNam
 
   const canRecognizeSpeech = Boolean(recognition);
 
+  const statusText = (() => {
+    if (isListening) return 'Listening...';
+    if (error) return error;
+    if (canRecognizeSpeech && micPermission === 'granted') return 'Ready for voice input';
+    if (!canRecognizeSpeech && micPermission === 'granted') return 'Mic enabled, but speech API is unavailable in this browser';
+    if (!canRecognizeSpeech) return 'Voice search unavailable here (try Chrome/Edge)';
+    if (micPermission === 'denied') return 'Microphone blocked. Enable it in site permissions.';
+    return 'Enable microphone to use voice search';
+  })();
+
   return (
-    <div className={cn("relative flex items-center", className)}>
+    <div className={cn("flex flex-col gap-2", className)}>
+      <div className="flex items-center gap-2">
       {canRecognizeSpeech ? (
         <button
           onClick={toggleListening}
@@ -140,14 +151,11 @@ export const VoiceSearch: React.FC<VoiceSearchProps> = ({ onTranscript, classNam
           <Mic size={18} />
         </button>
       ) : (
-        <div className="flex flex-col items-end gap-1">
-          <div
-            className="px-2 py-1 rounded-md border border-zinc-700 bg-zinc-900 text-[9px] text-zinc-400 uppercase tracking-wider font-semibold"
-            title={error || 'Voice search unavailable'}
-          >
-            Voice N/A
-          </div>
-          <p className="text-[9px] text-zinc-500 whitespace-nowrap">Try Chrome/Edge for voice</p>
+        <div
+          className="px-2 py-1 rounded-md border border-zinc-700 bg-zinc-900 text-[9px] text-zinc-400 uppercase tracking-wider font-semibold"
+          title={error || 'Voice search unavailable'}
+        >
+          Voice N/A
         </div>
       )}
 
@@ -163,39 +171,11 @@ export const VoiceSearch: React.FC<VoiceSearchProps> = ({ onTranscript, classNam
       >
         {micPermission === 'granted' ? 'Mic Enabled' : 'Enable Mic'}
       </button>
-      
-      {isListening && (
-        <div className="absolute right-full mr-3 px-3 py-1.5 bg-zinc-900 border border-zinc-800 rounded-lg whitespace-nowrap shadow-xl">
-          <div className="flex items-center gap-2">
-            <div className="flex gap-0.5">
-              <div className="w-1 h-3 bg-red-500 animate-[bounce_1s_infinite_0ms]"></div>
-              <div className="w-1 h-4 bg-red-500 animate-[bounce_1s_infinite_200ms]"></div>
-              <div className="w-1 h-2 bg-red-500 animate-[bounce_1s_infinite_400ms]"></div>
-            </div>
-            <span className="text-[10px] font-bold text-zinc-100 uppercase tracking-widest">Listening...</span>
-          </div>
-        </div>
-      )}
+      </div>
 
-      {(error || micPermission === 'denied' || micPermission === 'granted') && (
-        <div className="absolute top-full mt-2 right-0 w-64 p-2 bg-zinc-900 border border-zinc-700 rounded-lg text-[10px] z-50 shadow-xl">
-          <div className="flex items-start gap-2">
-            {micPermission === 'granted' ? (
-              <ShieldCheck size={13} className="text-emerald-400 shrink-0 mt-0.5" />
-            ) : (
-              <ShieldAlert size={13} className="text-amber-400 shrink-0 mt-0.5" />
-            )}
-            <div className="space-y-1">
-              <p className={cn("font-semibold", micPermission === 'granted' ? "text-emerald-300" : "text-amber-300")}>
-                {micPermission === 'granted' ? 'Microphone access is enabled' : 'Microphone access required'}
-              </p>
-              <p className="text-zinc-400 leading-relaxed">
-                {error || 'You can start voice search now.'}
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
+      <p className="text-[10px] text-zinc-500 leading-relaxed">
+        {statusText}
+      </p>
     </div>
   );
 };

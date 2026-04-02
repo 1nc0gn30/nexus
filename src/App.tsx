@@ -84,13 +84,13 @@ export default function App() {
                   placeholder="Search APIs..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full bg-zinc-900 border border-zinc-800 rounded-xl py-2.5 pl-10 pr-12 text-sm text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-zinc-700 transition-all"
-                />
-                <VoiceSearch 
-                  onTranscript={(text) => setSearchQuery(text)}
-                  className="absolute right-2 top-1/2 -translate-y-1/2"
+                  className="w-full bg-zinc-900 border border-zinc-800 rounded-xl py-2.5 pl-10 pr-4 text-sm text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-zinc-700 transition-all"
                 />
               </div>
+              <VoiceSearch 
+                onTranscript={(text) => setSearchQuery(text)}
+                className="px-1"
+              />
 
               <div className="flex flex-col gap-2">
                 <h2 className="text-[10px] text-zinc-600 font-mono uppercase tracking-widest px-3 hidden md:block">Categories</h2>

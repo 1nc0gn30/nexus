@@ -31,6 +31,10 @@ class APIHandler {
       // Always use server proxy to avoid browser CORS/ETP variance across endpoints.
       const targetUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
       const response = await axios.get(targetUrl);
+
+      if (typeof response.data === 'string' && response.data.trimStart().toLowerCase().startsWith('<!doctype html')) {
+        throw new Error('Proxy returned HTML instead of API data. Check /api/proxy deployment routing.');
+      }
       
       this.lastRequestTime = Date.now();
       this.cache.set(cacheKey, { data: response.data, timestamp: Date.now() });
