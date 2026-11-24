@@ -3,29 +3,35 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Nexus API Explorer | Tech Pro</title>
+    <title>Nexus API IDE — Open-Access Browser API Client & Workflow Chainer</title>
     <meta
       name="description"
-      content="Nexus by Tech Pro is an agentic API IDE to discover, test, and automate public API workflows from one fast mobile-first workspace."
+      content="Discover 223 public APIs, test HTTP requests with timing and JSON inspection, import and export cURL/fetch/Python/HTTPie, and chain multi-step API workflows directly in your browser."
     />
     <meta
       name="keywords"
-      content="Nexus API Explorer, API IDE, API testing, developer tools, AI agent API assistant, Tech Pro, https://757tech.pro"
+      content="Nexus API IDE, browser API client, cURL importer, API workflow chainer, public API catalog, REST tester, Neal Frazier Tech, NullAI"
     />
     <meta name="robots" content="index,follow,max-image-preview:large" />
-    <meta name="author" content="Tech Pro" />
+    <meta name="author" content="Neal Frazier Tech" />
     <meta name="theme-color" content="#09090b" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-
     <link rel="canonical" href="https://nexus.757tech.pro/" />
 
-    <meta property="og:title" content="Nexus API Explorer | Tech Pro" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+
+    <meta property="og:title" content="Nexus API IDE — Browser API Client & Workflow Chainer" />
     <meta
       property="og:description"
-      content="Agentic API IDE for discovery, request building, and real response testing. Built by Tech Pro."
+      content="Open-access developer IDE to explore 223 public APIs, run live HTTP requests, import/export cURL, and chain multi-step API workflows client-side."
     />
     <meta property="og:type" content="website" />
-    <meta property="og:site_name" content="Nexus API Explorer" />
+    <meta property="og:site_name" content="Nexus API IDE" />
     <meta property="og:url" content="https://nexus.757tech.pro/" />
     <meta property="og:image" content="https://nexus.757tech.pro/og-image.png" />
     <meta property="og:image:width" content="1200" />
@@ -34,19 +40,77 @@
     <meta property="og:locale" content="en_US" />
 
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Nexus API Explorer | Tech Pro" />
+    <meta name="twitter:site" content="@1nc0gn30" />
+    <meta name="twitter:creator" content="@1nc0gn30" />
+    <meta name="twitter:title" content="Nexus API IDE — Browser API Client & Workflow Chainer" />
     <meta
       name="twitter:description"
-      content="Agentic API IDE by Tech Pro for real request testing and API workflow automation."
+      content="Explore 223 public APIs, test HTTP requests, import/export cURL, and chain multi-step workflows in your browser with zero paywalls."
     />
     <meta name="twitter:image" content="https://nexus.757tech.pro/og-image.png" />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "WebApplication",
+            "name": "Nexus API IDE",
+            "url": "https://nexus.757tech.pro/",
+            "description": "Open-access in-browser API IDE for discovering 223 public APIs, testing HTTP requests, importing cURL commands, generating client snippets, and running multi-step chained workflows.",
+            "applicationCategory": "DeveloperApplication",
+            "operatingSystem": "Any",
+            "browserRequirements": "Requires a modern browser with JavaScript enabled",
+            "offers": {
+              "@type": "Offer",
+              "price": "0",
+              "priceCurrency": "USD"
+            },
+            "creator": {
+              "@type": "Organization",
+              "name": "Neal Frazier Tech",
+              "url": "https://nullai.tech",
+              "founder": {
+                "@type": "Person",
+                "name": "Neal Frazier",
+                "sameAs": "https://github.com/1nc0gn30"
+              }
+            }
+          },
+          {
+            "@type": "FAQPage",
+            "mainEntity": [
+              {
+                "@type": "Question",
+                "name": "What can I build and test with Nexus API IDE?",
+                "acceptedAnswer": {
+                  "@type": "Answer",
+                  "text": "Nexus lets developers search 223 public APIs, send live HTTP requests with custom headers, query parameters, and JSON payloads, import raw cURL commands, generate cURL/JavaScript fetch/Python requests/HTTPie snippets, and chain multi-step workflows using {{step1.data.field}} variable interpolation."
+                }
+              },
+              {
+                "@type": "Question",
+                "name": "Is Nexus API IDE free and how is my data handled?",
+                "acceptedAnswer": {
+                  "@type": "Answer",
+                  "text": "Nexus is 100% open-access with zero paywalls or rate limits. Collections, workflows, request history, and optional API keys stay in your browser localStorage and can be exported or imported as JSON at any time."
+                }
+              },
+              {
+                "@type": "Question",
+                "name": "How does Nexus handle CORS restrictions and offline testing?",
+                "acceptedAnswer": {
+                  "@type": "Answer",
+                  "text": "Nexus supports three transport modes: Direct browser fetch for CORS-enabled public APIs, an optional /api/proxy function when deployed on Netlify or Node, and an Offline Mock mode with realistic sample JSON payloads for testing without network access."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    </script>
   </head>
   <body>
-    <!-- Netlify form detection fallback (static HTML required at build time). -->
-    <form name="waitlist" method="POST" data-netlify="true" hidden>
-      <input type="hidden" name="form-name" value="waitlist" />
-      <input type="email" name="email" />
-    </form>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

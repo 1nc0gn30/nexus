@@ -1,4 +1,16 @@
 const TEXTUAL_CONTENT_TYPE_REGEX = /^(application\/(json|.*\+json|xml|javascript)|text\/|image\/svg\+xml)/i;
+const BLOCKED_HOSTS = /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0|\[?::1\]?)/i;
+const HOP_BY_HOP_HEADERS = new Set([
+  'host',
+  'connection',
+  'content-length',
+  'transfer-encoding',
+  'keep-alive',
+  'upgrade',
+  'cookie',
+  'origin',
+  'referer',
+]);
 
 function extractUrl(event) {
   const queryUrl = event.queryStringParameters?.url;
@@ -14,6 +26,22 @@ function extractUrl(event) {
   }
 }
 
+function validateTargetUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return 'Invalid URL format';
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    return 'Only HTTP and HTTPS protocols are permitted';
+  }
+  if (BLOCKED_HOSTS.test(parsed.hostname)) {
+    return 'Private or loopback network hosts are blocked';
+  }
+  return null;
+}
+
 exports.handler = async (event) => {
   const targetUrl = extractUrl(event);
   if (!targetUrl) {
@@ -24,19 +52,32 @@ exports.handler = async (event) => {
     };
   }
 
+  const validationError = validateTargetUrl(targetUrl);
+  if (validationError) {
+    return {
+      statusCode: 400,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ error: validationError }),
+    };
+  }
+
   const method = (event.httpMethod || 'GET').toUpperCase();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
 
   try {
     const headers = {
-      'User-Agent': 'Nexus-API-Explorer/1.0',
+      'User-Agent': 'Nexus-API-IDE/2.0',
       Accept: '*/*',
     };
 
-    const incomingContentType = event.headers?.['content-type'] || event.headers?.['Content-Type'];
-    if (incomingContentType && !['GET', 'HEAD'].includes(method)) {
-      headers['Content-Type'] = incomingContentType;
+    for (const [k, v] of Object.entries(event.headers || {})) {
+      const lower = k.toLowerCase();
+      if (!v || HOP_BY_HOP_HEADERS.has(lower) || lower.startsWith('x-nf-') || lower.startsWith('x-forwarded-')) {
+        continue;
+      }
+      if (lower === 'content-type' && ['GET', 'HEAD'].includes(method)) continue;
+      headers[k] = v;
     }
 
     const body = ['GET', 'HEAD'].includes(method)

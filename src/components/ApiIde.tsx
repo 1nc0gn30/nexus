@@ -1,861 +1,1295 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import {
-  Sparkles,
-  Terminal,
-  Trash2,
+  Send,
+  Loader2,
   Copy,
   Check,
-  Loader2,
-  AlertCircle,
-  Globe,
-  Shield,
-  Settings,
-  BrainCircuit,
+  Trash2,
+  Plus,
+  Terminal,
   Code2,
-  Send,
-  Bot,
-  Play,
+  Bookmark,
+  FolderOpen,
+  Download,
+  Upload,
+  Sparkles,
+  Settings,
   X,
+  AlertCircle,
+  Clock,
+  FileCode2,
+  Wand2,
+  History,
+  Menu,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { motion, AnimatePresence } from 'motion/react';
-import { GoogleGenAI } from '@google/genai';
-import axios from 'axios';
-
-interface RequestHistory {
-  id: string;
-  method: string;
-  url: string;
-  timestamp: number;
-}
+import { PublicAPI } from '../data/registry';
+import {
+  KeyValueItem,
+  buildUrlWithParams,
+  extractQueryParams,
+  parseCurlCommand,
+} from '../lib/curlParser';
+import { CodeLanguage, generateCodeSnippet } from '../lib/codeGenerator';
+import { executeHttpRequest, ExecutionResult, TransportMode } from '../lib/httpClient';
+import {
+  RequestHistoryItem,
+  SavedCollection,
+  SavedRequest,
+} from '../lib/collections';
+import { planLocalRequest } from '../lib/localAgent';
+import { JsonTree } from './JsonTree';
 
 interface ApiIdeProps {
-  initialUrl?: string;
-  initialMethod?: string;
+  catalog: PublicAPI[];
+  method: string;
+  baseUrl: string;
+  queryParams: KeyValueItem[];
+  headers: KeyValueItem[];
+  body: string;
+  onChangeMethod: (m: string) => void;
+  onChangeBaseUrl: (u: string) => void;
+  onChangeQueryParams: (p: KeyValueItem[]) => void;
+  onChangeHeaders: (h: KeyValueItem[]) => void;
+  onChangeBody: (b: string) => void;
+  collections: SavedCollection[];
+  onSaveRequest: (collectionId: string, req: SavedRequest) => void;
+  onDeleteSavedRequest: (collectionId: string, reqId: string) => void;
+  onLoadSavedRequest: (req: SavedRequest) => void;
+  onExportWorkspace: () => void;
+  onImportWorkspace: (rawJson: string) => { ok: boolean; message: string };
+  history: RequestHistoryItem[];
+  onPushHistory: (item: RequestHistoryItem) => void;
+  onClearHistory: () => void;
 }
 
-interface AgentPlan {
-  method?: string;
-  url?: string;
-  headers?: string | Record<string, string>;
-  body?: string | Record<string, unknown>;
-  explanation?: string;
-  next_steps?: string[];
-  auto_send?: boolean;
-}
-
+const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'];
 const GEMINI_KEY_STORAGE = 'nexus_gemini_api_key';
-const OPENAI_KEY_STORAGE = 'nexus_openai_api_key';
 
-export const ApiIde: React.FC<ApiIdeProps> = ({ initialUrl, initialMethod }) => {
-  const [method, setMethod] = useState(initialMethod || 'GET');
-  const [url, setUrl] = useState(initialUrl || 'https://jsonplaceholder.typicode.com/todos/1');
-  const [headers, setHeaders] = useState('{\n  "Content-Type": "application/json"\n}');
-  const [body, setBody] = useState('{\n  "title": "foo",\n  "body": "bar",\n  "userId": 1\n}');
-  const [response, setResponse] = useState<any>(null);
-  const [statusCode, setStatusCode] = useState<number | null>(null);
+const METHOD_COLORS: Record<string, string> = {
+  GET: 'text-emerald-400',
+  POST: 'text-sky-400',
+  PUT: 'text-amber-400',
+  PATCH: 'text-violet-400',
+  DELETE: 'text-rose-400',
+  HEAD: 'text-zinc-300',
+};
+
+const SAMPLE_CURL_PRESETS = [
+  {
+    label: 'POST JSONPlaceholder',
+    cmd: `curl -X POST 'https://jsonplaceholder.typicode.com/posts' \\\n  -H 'Content-Type: application/json' \\\n  -H 'Accept: application/json' \\\n  -d '{"title":"Nexus cURL Import","body":"Parsed client-side","userId":1}'`,
+  },
+  {
+    label: 'GET GitHub User',
+    cmd: `curl -H 'Accept: application/vnd.github+json' 'https://api.github.com/users/1nc0gn30'`,
+  },
+  {
+    label: 'GET Open-Meteo Forecast',
+    cmd: `curl -G 'https://api.open-meteo.com/v1/forecast' -d 'latitude=52.52' -d 'longitude=13.41' -d 'current_weather=true'`,
+  },
+];
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+export const ApiIde: React.FC<ApiIdeProps> = ({
+  catalog,
+  method,
+  baseUrl,
+  queryParams,
+  headers,
+  body,
+  onChangeMethod,
+  onChangeBaseUrl,
+  onChangeQueryParams,
+  onChangeHeaders,
+  onChangeBody,
+  collections,
+  onSaveRequest,
+  onDeleteSavedRequest,
+  onLoadSavedRequest,
+  onExportWorkspace,
+  onImportWorkspace,
+  history,
+  onPushHistory,
+  onClearHistory,
+}) => {
+  const [transport, setTransport] = useState<TransportMode>('direct');
+  const [reqTab, setReqTab] = useState<'params' | 'headers' | 'body' | 'code' | 'assistant'>('params');
+  const [resTab, setResTab] = useState<'tree' | 'raw' | 'headers'>('tree');
+  const [codeLang, setCodeLang] = useState<CodeLanguage>('curl');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [history, setHistory] = useState<RequestHistory[]>([]);
-  const [copied, setCopied] = useState(false);
-  const [requestCount, setRequestCount] = useState(0);
-  const [showWaitlist, setShowWaitlist] = useState(false);
-  const [mobileWorkspaceTab, setMobileWorkspaceTab] = useState<'headers' | 'body' | 'response'>('headers');
+  const [result, setResult] = useState<ExecutionResult | null>(null);
+  const [copiedCode, setCopiedCode] = useState(false);
+  const [copiedRes, setCopiedRes] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
 
-  const RATE_LIMIT = 5;
-  const TIME_WINDOW = 60000;
+  // Sidebars & Modals
+  const [sidebarTab, setSidebarTab] = useState<'collections' | 'history'>('collections');
+  const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
+  const [curlModalOpen, setCurlModalOpen] = useState(false);
+  const [curlInput, setCurlInput] = useState('');
+  const [curlError, setCurlError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (initialUrl) setUrl(initialUrl);
-    if (initialMethod) setMethod(initialMethod);
-  }, [initialUrl, initialMethod]);
+  // Assistant state (zero-key local planner + optional BYOK Gemini)
+  const [agentPrompt, setAgentPrompt] = useState('');
+  const [agentOutput, setAgentOutput] = useState<{ explanation: string; nextSteps: string[] } | null>(null);
+  const [agentLoading, setAgentLoading] = useState(false);
+  const [showByokSettings, setShowByokSettings] = useState(false);
+  const [geminiKey, setGeminiKey] = useState(() =>
+    typeof window !== 'undefined' ? window.localStorage.getItem(GEMINI_KEY_STORAGE) || '' : '',
+  );
 
-  // AI state
-  const [aiPrompt, setAiPrompt] = useState('');
-  const [aiLoading, setAiLoading] = useState(false);
-  const [aiResponse, setAiResponse] = useState<string | null>(null);
-  const [aiNextSteps, setAiNextSteps] = useState<string[]>([]);
-  const [autoRan, setAutoRan] = useState(false);
-  const [customApiKey, setCustomApiKey] = useState('');
-  const [openAiApiKey, setOpenAiApiKey] = useState('');
-  const [showSettings, setShowSettings] = useState(false);
-  const [showMobileAgentPanel, setShowMobileAgentPanel] = useState(false);
+  const importFileRef = useRef<HTMLInputElement | null>(null);
 
-  const methods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    setCustomApiKey(localStorage.getItem(GEMINI_KEY_STORAGE) || '');
-    setOpenAiApiKey(localStorage.getItem(OPENAI_KEY_STORAGE) || '');
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    if (customApiKey) {
-      localStorage.setItem(GEMINI_KEY_STORAGE, customApiKey);
-    } else {
-      localStorage.removeItem(GEMINI_KEY_STORAGE);
-    }
-  }, [customApiKey]);
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    if (openAiApiKey) {
-      localStorage.setItem(OPENAI_KEY_STORAGE, openAiApiKey);
-    } else {
-      localStorage.removeItem(OPENAI_KEY_STORAGE);
-    }
-  }, [openAiApiKey]);
-
-  const normalizeJsonInput = (value: unknown, fallback: string) => {
-    if (!value) return fallback;
-    if (typeof value === 'string') return value;
-    return JSON.stringify(value, null, 2);
+  const showToast = (msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast((cur) => (cur === msg ? null : cur)), 2400);
   };
 
-  const sendRequest = async (override?: {
+  const fullUrl = useMemo(
+    () => buildUrlWithParams(baseUrl, queryParams),
+    [baseUrl, queryParams],
+  );
+
+  const codeSnippet = useMemo(
+    () => generateCodeSnippet({ method, baseUrl, queryParams, headers, body }, codeLang),
+    [method, baseUrl, queryParams, headers, body, codeLang],
+  );
+
+  const bodyJsonError = useMemo(() => {
+    if (['GET', 'HEAD'].includes(method) || !body.trim()) return null;
+    try {
+      JSON.parse(body);
+      return null;
+    } catch (e: unknown) {
+      return e instanceof Error ? e.message : 'Invalid JSON';
+    }
+  }, [method, body]);
+
+  const handleUrlInputChange = (nextRaw: string) => {
+    const { baseUrl: nextBase, params: nextParams } = extractQueryParams(nextRaw);
+    onChangeBaseUrl(nextBase);
+    onChangeQueryParams(nextParams);
+  };
+
+  const handleSend = async (override?: {
     method?: string;
-    url?: string;
-    headers?: string;
+    baseUrl?: string;
+    queryParams?: KeyValueItem[];
+    headers?: KeyValueItem[];
     body?: string;
   }) => {
-    if (requestCount >= RATE_LIMIT) {
-      setShowWaitlist(true);
-      return;
-    }
-
-    const nextMethod = override?.method || method;
-    const nextUrl = override?.url || url;
-    const nextHeaders = override?.headers ?? headers;
-    const nextBody = override?.body ?? body;
+    const m = override?.method ?? method;
+    const bUrl = override?.baseUrl ?? baseUrl;
+    const qParams = override?.queryParams ?? queryParams;
+    const hdrs = override?.headers ?? headers;
+    const bdy = override?.body ?? body;
 
     setLoading(true);
-    setError(null);
-    setResponse(null);
-    setStatusCode(null);
+    const exec = await executeHttpRequest({
+      method: m,
+      baseUrl: bUrl,
+      queryParams: qParams,
+      headers: hdrs,
+      body: bdy,
+      transport,
+    });
+    setResult(exec);
+    setLoading(false);
 
-    try {
-      const parsedHeaders = JSON.parse(nextHeaders);
-      const parsedBody = nextMethod !== 'GET' ? JSON.parse(nextBody) : undefined;
-      const proxyUrl = `/api/proxy?url=${encodeURIComponent(nextUrl)}`;
-
-      const res = await axios({
-        method: nextMethod,
-        url: proxyUrl,
-        headers: parsedHeaders,
-        data: parsedBody,
-      });
-
-      setStatusCode(res.status);
-      setResponse(res.data);
-      setMobileWorkspaceTab('response');
-      setRequestCount((prev) => prev + 1);
-
-      setTimeout(() => {
-        setRequestCount((prev) => Math.max(0, prev - 1));
-      }, TIME_WINDOW);
-
-      const newHistory: RequestHistory = {
-        id: Math.random().toString(36).slice(2, 11),
-        method: nextMethod,
-        url: nextUrl,
+    if (exec.url) {
+      onPushHistory({
+        id: `hist-${Date.now()}`,
+        method: m,
+        url: exec.url,
+        status: exec.status || null,
+        durationMs: exec.durationMs,
         timestamp: Date.now(),
-      };
-      setHistory((prev) => [newHistory, ...prev].slice(0, 10));
-    } catch (err: any) {
-      setStatusCode(err.response?.status || null);
-      setError(err.response?.data?.details || err.message || 'Request failed');
-      if (err.response?.data) setResponse(err.response.data);
-      setMobileWorkspaceTab('response');
-    } finally {
-      setLoading(false);
+      });
     }
   };
 
-  const buildAgentPrompt = () => {
-    return `You are Nexus Agent, an execution-oriented API copilot.
-
-You MUST return only valid JSON with these fields:
-{
-  "method": "GET | POST | PUT | PATCH | DELETE",
-  "url": "full url",
-  "headers": "JSON string",
-  "body": "JSON string",
-  "explanation": "What you changed and why in under 80 words",
-  "next_steps": ["step 1", "step 2"],
-  "auto_send": true or false
-}
-
-Rules:
-- Make concrete updates, not generic advice.
-- If user intent is clear, set auto_send=true.
-- If user asks for risky or unclear changes, set auto_send=false.
-- Keep headers/body as valid JSON strings.
-- Never return markdown.
-
-User request:
-"${aiPrompt}"
-
-Current request state:
-Method: ${method}
-URL: ${url}
-Headers: ${headers}
-Body: ${body}`;
+  const handleImportCurl = () => {
+    setCurlError(null);
+    try {
+      const parsed = parseCurlCommand(curlInput);
+      onChangeMethod(parsed.method);
+      onChangeBaseUrl(parsed.baseUrl);
+      onChangeQueryParams(parsed.queryParams);
+      onChangeHeaders(
+        parsed.headers.length > 0
+          ? parsed.headers
+          : [{ id: `h-${Date.now()}`, key: 'Accept', value: 'application/json', enabled: true }],
+      );
+      onChangeBody(parsed.body);
+      setCurlModalOpen(false);
+      setCurlInput('');
+      showToast(`Imported ${parsed.method} ${parsed.baseUrl}`);
+    } catch (err: unknown) {
+      setCurlError(err instanceof Error ? err.message : 'Failed to parse cURL');
+    }
   };
 
-  const handleAiPrompt = async () => {
-    if (!aiPrompt.trim()) return;
-    setAiLoading(true);
-    setAiResponse(null);
-    setAiNextSteps([]);
-    setAutoRan(false);
+  const handleSaveCurrent = () => {
+    const col = collections[0];
+    if (!col) return;
+    let shortName = baseUrl || 'Untitled Request';
+    try {
+      const u = new URL(baseUrl);
+      shortName = `${u.hostname}${u.pathname === '/' ? '' : u.pathname}`;
+    } catch {
+      // keep raw
+    }
+    onSaveRequest(col.id, {
+      id: `req-${Date.now()}`,
+      name: `${method} ${shortName}`.slice(0, 48),
+      method,
+      baseUrl,
+      queryParams,
+      headers,
+      body,
+      updatedAt: Date.now(),
+    });
+    showToast(`Saved to "${col.name}"`);
+  };
+
+  const handleRunAssistant = async () => {
+    if (!agentPrompt.trim() || agentLoading) return;
+    setAgentLoading(true);
+    setAgentOutput(null);
 
     try {
-      if (!customApiKey && !openAiApiKey) {
-        throw new Error('Add a Gemini or OpenAI key in settings to run the AI Agent.');
-      }
-
-      let data: AgentPlan = {};
-
-      if (customApiKey) {
-        const ai = new GoogleGenAI({ apiKey: customApiKey });
-        const model = 'gemini-3-flash-preview';
-        const result = await ai.models.generateContent({
-          model,
-          contents: buildAgentPrompt(),
+      if (geminiKey.trim()) {
+        const { GoogleGenAI } = await import('@google/genai');
+        const ai = new GoogleGenAI({ apiKey: geminiKey.trim() });
+        const aiRes = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: `Return ONLY valid JSON: {"method":"GET|POST|PUT|PATCH|DELETE","url":"https://...","headers":{"Accept":"application/json"},"body":"","explanation":"<60 words","nextSteps":["..."],"autoSend":false}\nUser task: ${agentPrompt}\nCurrent: ${method} ${fullUrl}`,
           config: { responseMimeType: 'application/json' },
         });
-        data = JSON.parse(result.text || '{}');
-      } else if (openAiApiKey) {
-        const openAiRes = await axios.post(
-          'https://api.openai.com/v1/chat/completions',
-          {
-            model: 'gpt-4o-mini',
-            messages: [
-              {
-                role: 'system',
-                content:
-                  'You are an execution-oriented API agent. Return only a JSON object with method,url,headers,body,explanation,next_steps,auto_send.',
-              },
-              {
-                role: 'user',
-                content: buildAgentPrompt(),
-              },
-            ],
-            response_format: { type: 'json_object' },
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${openAiApiKey}`,
-              'Content-Type': 'application/json',
-            },
-          },
-        );
+        const parsed = JSON.parse(aiRes.text || '{}');
+        const nextMethod = parsed.method || method;
+        const { baseUrl: nextBase, params: nextParams } = extractQueryParams(parsed.url || fullUrl);
+        const nextHeaders: KeyValueItem[] =
+          parsed.headers && typeof parsed.headers === 'object'
+            ? Object.entries(parsed.headers).map(([k, v], i) => ({
+                id: `ai-h-${i}-${Date.now()}`,
+                key: k,
+                value: String(v),
+                enabled: true,
+              }))
+            : headers;
+        const nextBody =
+          typeof parsed.body === 'string'
+            ? parsed.body
+            : parsed.body
+              ? JSON.stringify(parsed.body, null, 2)
+              : body;
 
-        const content = openAiRes.data.choices[0]?.message?.content;
-        data = typeof content === 'string' ? JSON.parse(content) : {};
-      }
-
-      const nextMethod = data.method || method;
-      const nextUrl = data.url || url;
-      const nextHeaders = normalizeJsonInput(data.headers, headers);
-      const nextBody = normalizeJsonInput(data.body, body);
-
-      if (data.method) setMethod(data.method);
-      if (data.url) setUrl(data.url);
-      if (data.headers) setHeaders(nextHeaders);
-      if (data.body) setBody(nextBody);
-
-      if (Array.isArray(data.next_steps)) {
-        setAiNextSteps(data.next_steps.filter(Boolean).slice(0, 4));
-      }
-
-      if (data.explanation) setAiResponse(data.explanation);
-
-      const shouldAutoSend = Boolean(data.auto_send);
-      if (shouldAutoSend) {
-        await sendRequest({
-          method: nextMethod,
-          url: nextUrl,
-          headers: nextHeaders,
-          body: nextBody,
+        onChangeMethod(nextMethod);
+        onChangeBaseUrl(nextBase);
+        onChangeQueryParams(nextParams);
+        onChangeHeaders(nextHeaders);
+        onChangeBody(nextBody);
+        setAgentOutput({
+          explanation: parsed.explanation || 'Updated request configuration.',
+          nextSteps: Array.isArray(parsed.nextSteps) ? parsed.nextSteps : [],
         });
-        setAutoRan(true);
+        if (parsed.autoSend) {
+          await handleSend({
+            method: nextMethod,
+            baseUrl: nextBase,
+            queryParams: nextParams,
+            headers: nextHeaders,
+            body: nextBody,
+          });
+        }
+      } else {
+        const plan = planLocalRequest(
+          agentPrompt,
+          { method, baseUrl, queryParams, headers, body },
+          catalog,
+        );
+        onChangeMethod(plan.method);
+        onChangeBaseUrl(plan.baseUrl);
+        onChangeQueryParams(plan.queryParams);
+        onChangeHeaders(plan.headers);
+        onChangeBody(plan.body);
+        setAgentOutput({ explanation: plan.explanation, nextSteps: plan.nextSteps });
+        if (plan.shouldAutoSend) {
+          await handleSend({
+            method: plan.method,
+            baseUrl: plan.baseUrl,
+            queryParams: plan.queryParams,
+            headers: plan.headers,
+            body: plan.body,
+          });
+        }
       }
-
-      setAiPrompt('');
-    } catch (err: any) {
-      setAiResponse(`AI Error: ${err.message}`);
+      setAgentPrompt('');
+    } catch (err: unknown) {
+      setAgentOutput({
+        explanation: err instanceof Error ? err.message : 'Assistant could not parse task.',
+        nextSteps: ['Try pasting a URL, cURL command, or API name from the catalog.'],
+      });
     } finally {
-      setAiLoading(false);
+      setAgentLoading(false);
     }
   };
 
-  const copyToClipboard = () => {
-    navigator.clipboard.writeText(JSON.stringify(response, null, 2));
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const handleFileImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const outcome = onImportWorkspace(String(reader.result || ''));
+      showToast(outcome.message);
+    };
+    reader.readAsText(file);
+    e.target.value = '';
   };
 
-  const aiPanelBody = (
-    <>
-      <div className="flex-1 overflow-y-auto p-5 space-y-5 custom-scrollbar">
-        <AnimatePresence>
-          {showSettings && (
-            <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              className="overflow-hidden space-y-3 pb-5 border-b border-zinc-800"
-            >
-              <p className="text-[11px] text-zinc-500 font-mono uppercase tracking-widest">Configuration</p>
-              <div className="space-y-3">
-                <div className="space-y-1.5">
-                  <label className="text-[11px] text-zinc-600 font-mono">Gemini API Key</label>
-                  <input
-                    type="password"
-                    value={customApiKey}
-                    onChange={(e) => setCustomApiKey(e.target.value)}
-                    placeholder="Enter Gemini Key"
-                    className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2.5 text-xs text-zinc-300 focus:outline-none focus:ring-1 focus:ring-zinc-700"
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <label className="text-[11px] text-zinc-600 font-mono">OpenAI API Key</label>
-                  <input
-                    type="password"
-                    value={openAiApiKey}
-                    onChange={(e) => setOpenAiApiKey(e.target.value)}
-                    placeholder="Enter OpenAI Key"
-                    className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2.5 text-xs text-zinc-300 focus:outline-none focus:ring-1 focus:ring-zinc-700"
-                  />
-                </div>
-                <p className="text-[10px] text-zinc-600 leading-tight">
-                  Keys stay in your browser storage and are used client-side during this phase.
-                </p>
-              </div>
-            </motion.div>
+  const addHeaderPreset = (type: 'bearer' | 'json' | 'apikey') => {
+    if (type === 'bearer') {
+      onChangeHeaders([
+        ...headers,
+        { id: `h-${Date.now()}`, key: 'Authorization', value: 'Bearer YOUR_TOKEN', enabled: true },
+      ]);
+    } else if (type === 'json') {
+      onChangeHeaders([
+        ...headers,
+        { id: `h-${Date.now()}`, key: 'Content-Type', value: 'application/json', enabled: true },
+      ]);
+    } else {
+      onChangeHeaders([
+        ...headers,
+        { id: `h-${Date.now()}`, key: 'X-API-Key', value: 'YOUR_API_KEY', enabled: true },
+      ]);
+    }
+  };
+
+  const sidebarContent = (
+    <div className="flex flex-col flex-1 min-h-0 h-full">
+      <div className="p-3 border-b border-zinc-800 flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={() => setSidebarTab('collections')}
+          className={cn(
+            'flex-1 min-h-[36px] rounded-lg text-xs font-medium flex items-center justify-center gap-1.5 transition-colors',
+            sidebarTab === 'collections'
+              ? 'bg-zinc-800 text-zinc-100'
+              : 'text-zinc-400 hover:text-zinc-200',
           )}
-        </AnimatePresence>
+        >
+          <FolderOpen size={13} />
+          <span>Collections</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setSidebarTab('history')}
+          className={cn(
+            'flex-1 min-h-[36px] rounded-lg text-xs font-medium flex items-center justify-center gap-1.5 transition-colors',
+            sidebarTab === 'history'
+              ? 'bg-zinc-800 text-zinc-100'
+              : 'text-zinc-400 hover:text-zinc-200',
+          )}
+        >
+          <History size={13} />
+          <span>History ({history.length})</span>
+        </button>
+      </div>
 
-        <div className="p-4 bg-zinc-900/50 border border-zinc-800 rounded-xl space-y-2">
-          <div className="flex items-center gap-2 text-[11px] text-zinc-500 font-mono uppercase tracking-widest">
-            <Bot size={12} />
-            <span>Agent Mode</span>
+      <div className="flex-1 overflow-y-auto p-3 space-y-4 custom-scrollbar">
+        {sidebarTab === 'collections' ? (
+          collections.map((col) => (
+            <div key={col.id} className="space-y-1.5">
+              <div className="flex items-center justify-between px-1">
+                <span className="text-[11px] font-mono uppercase tracking-wider text-zinc-500 truncate">
+                  {col.name}
+                </span>
+                <span className="text-[10px] font-mono text-zinc-600">{col.requests.length}</span>
+              </div>
+              {col.requests.map((req) => (
+                <div
+                  key={req.id}
+                  className="group flex items-center gap-1 rounded-xl border border-zinc-800/70 bg-zinc-950/60 hover:border-zinc-700 transition-colors"
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onLoadSavedRequest(req);
+                      setMobileDrawerOpen(false);
+                    }}
+                    className="flex-1 min-w-0 flex items-center gap-2 px-2.5 py-2 text-left"
+                  >
+                    <span
+                      className={cn(
+                        'text-[10px] font-mono font-bold w-10 shrink-0',
+                        METHOD_COLORS[req.method] || 'text-zinc-400',
+                      )}
+                    >
+                      {req.method}
+                    </span>
+                    <span className="text-xs text-zinc-300 group-hover:text-zinc-100 truncate">
+                      {req.name}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onDeleteSavedRequest(col.id, req.id)}
+                    aria-label={`Delete ${req.name}`}
+                    className="p-2 text-zinc-600 hover:text-rose-400 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ))
+        ) : history.length === 0 ? (
+          <div className="py-10 text-center space-y-2 text-zinc-500">
+            <Clock size={20} className="mx-auto opacity-50" />
+            <p className="text-xs">Sent requests appear here.</p>
           </div>
-          <ul className="text-xs text-zinc-400 space-y-1.5 list-disc pl-4">
-            <li>Builds and edits request config</li>
-            <li>Can auto-run when intent is clear</li>
-            <li>Returns immediate next actions</li>
-          </ul>
-        </div>
-
-        <div className="space-y-2">
-          <p className="text-[11px] text-zinc-500 font-mono uppercase tracking-widest">Quick Tasks</p>
-          <div className="grid grid-cols-1 gap-2">
-            {[
-              'Create an authenticated GET request for this endpoint',
-              'Turn this into a POST create-user request with valid JSON body',
-              'Harden headers and explain any required auth format',
-            ].map((quick) => (
+        ) : (
+          <div className="space-y-1.5">
+            <div className="flex justify-end">
               <button
-                key={quick}
-                onClick={() => setAiPrompt(quick)}
-                className="text-left text-xs px-3 py-2 rounded-lg border border-zinc-800 bg-zinc-900/30 hover:bg-zinc-800/60 text-zinc-300 transition-colors"
+                type="button"
+                onClick={onClearHistory}
+                className="text-[11px] font-mono text-zinc-500 hover:text-rose-400"
               >
-                {quick}
+                Clear history
+              </button>
+            </div>
+            {history.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => {
+                  onChangeMethod(item.method);
+                  handleUrlInputChange(item.url);
+                  setMobileDrawerOpen(false);
+                }}
+                className="w-full text-left p-2.5 rounded-xl border border-zinc-800/70 bg-zinc-950/60 hover:border-zinc-700 space-y-1"
+              >
+                <div className="flex items-center justify-between text-[10px] font-mono">
+                  <span className={cn('font-bold', METHOD_COLORS[item.method] || 'text-zinc-400')}>
+                    {item.method}
+                  </span>
+                  <span className="text-zinc-500">
+                    {item.status ? `${item.status}` : 'ERR'} · {item.durationMs ?? 0}ms
+                  </span>
+                </div>
+                <p className="text-[11px] font-mono text-zinc-400 truncate">{item.url}</p>
               </button>
             ))}
           </div>
-        </div>
-
-        <div className="space-y-2">
-          <p className="text-[11px] text-zinc-500 font-mono uppercase tracking-widest">Instruction</p>
-          <div className="relative">
-            <textarea
-              value={aiPrompt}
-              onChange={(e) => setAiPrompt(e.target.value)}
-              placeholder="Tell the agent what to do, e.g. Build a Stripe customer create request and run it."
-              className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-4 text-sm text-zinc-200 placeholder:text-zinc-700 focus:outline-none focus:ring-2 focus:ring-zinc-700 min-h-[170px] resize-none transition-all"
-            />
-            <button
-              onClick={handleAiPrompt}
-              disabled={aiLoading || !aiPrompt.trim()}
-              className="absolute bottom-3 right-3 flex items-center gap-2 px-3 py-2 bg-zinc-800 hover:bg-zinc-700 disabled:bg-zinc-900 text-zinc-100 disabled:text-zinc-700 rounded-lg text-xs font-semibold transition-all"
-            >
-              {aiLoading ? <Loader2 className="animate-spin" size={14} /> : <Play size={14} />}
-              <span>Run Agent</span>
-            </button>
-          </div>
-        </div>
-
-        <AnimatePresence>
-          {aiResponse && (
-            <motion.div
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              className="p-4 bg-amber-500/5 border border-amber-500/20 rounded-xl space-y-3"
-            >
-              <div className="flex items-center gap-2 text-[11px] text-amber-500 font-mono uppercase tracking-widest">
-                <Sparkles size={12} />
-                <span>Agent Update</span>
-                {autoRan && <span className="text-emerald-500">Auto-Ran</span>}
-              </div>
-              <p className="text-sm text-zinc-300 leading-relaxed">{aiResponse}</p>
-              {aiNextSteps.length > 0 && (
-                <div className="space-y-1.5 pt-1">
-                  {aiNextSteps.map((step, idx) => (
-                    <p key={`${step}-${idx}`} className="text-xs text-zinc-400">
-                      {idx + 1}. {step}
-                    </p>
-                  ))}
-                </div>
-              )}
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        <div className="space-y-3 pt-4 border-t border-zinc-800">
-          <p className="text-[11px] text-zinc-500 font-mono uppercase tracking-widest">Recent History</p>
-          {history.length > 0 ? (
-            <div className="space-y-2">
-              {history.map((item) => (
-                <button
-                  key={item.id}
-                  onClick={() => {
-                    setMethod(item.method);
-                    setUrl(item.url);
-                  }}
-                  className="w-full flex items-center gap-3 p-2.5 bg-zinc-900/50 hover:bg-zinc-800 rounded-lg border border-zinc-800 transition-all text-left group"
-                >
-                  <span
-                    className={cn(
-                      'text-[9px] font-bold px-1.5 py-0.5 rounded uppercase tracking-tighter',
-                      item.method === 'GET'
-                        ? 'bg-emerald-500/10 text-emerald-500'
-                        : item.method === 'POST'
-                          ? 'bg-blue-500/10 text-blue-500'
-                          : 'bg-zinc-700 text-zinc-400',
-                    )}
-                  >
-                    {item.method}
-                  </span>
-                  <span className="flex-1 text-[11px] text-zinc-400 truncate font-mono group-hover:text-zinc-200 transition-colors">
-                    {item.url}
-                  </span>
-                </button>
-              ))}
-            </div>
-          ) : (
-            <p className="text-[11px] text-zinc-700 italic">No history yet</p>
-          )}
-        </div>
+        )}
       </div>
 
-      <div className="p-4 border-t border-zinc-800 bg-zinc-950/50">
-        <div className="flex items-center gap-2 text-[11px] text-zinc-600 font-mono">
-          <Settings size={12} />
-          <span>Proxy Enabled</span>
-        </div>
+      <div className="p-3 border-t border-zinc-800 grid grid-cols-2 gap-2">
+        <button
+          type="button"
+          onClick={onExportWorkspace}
+          className="min-h-[38px] rounded-xl border border-zinc-800 bg-zinc-950 hover:border-zinc-700 text-zinc-300 text-xs font-medium flex items-center justify-center gap-1.5"
+        >
+          <Download size={13} />
+          <span>Export</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => importFileRef.current?.click()}
+          className="min-h-[38px] rounded-xl border border-zinc-800 bg-zinc-950 hover:border-zinc-700 text-zinc-300 text-xs font-medium flex items-center justify-center gap-1.5"
+        >
+          <Upload size={13} />
+          <span>Import</span>
+        </button>
+        <input
+          ref={importFileRef}
+          type="file"
+          accept="application/json,.json"
+          onChange={handleFileImport}
+          className="hidden"
+          aria-label="Import workspace JSON"
+        />
       </div>
-    </>
+    </div>
   );
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 bg-zinc-950">
-      <AnimatePresence>
-        {showWaitlist && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-zinc-950/80 backdrop-blur-md"
-          >
-            <motion.div
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              className="w-full max-w-md bg-zinc-900 border border-zinc-800 rounded-3xl p-8 shadow-2xl space-y-6"
-            >
-              <div className="text-center space-y-2">
-                <div className="w-16 h-16 bg-amber-500/10 rounded-2xl flex items-center justify-center mx-auto mb-4">
-                  <Shield className="text-amber-500" size={32} />
-                </div>
-                <h2 className="text-2xl font-bold text-zinc-100">Rate Limit Reached</h2>
-                <p className="text-zinc-400 text-sm">
-                  You&apos;ve reached the free tier limit. Join the Nexus waitlist for unlimited access and{' '}
-                  <span className="text-amber-500 font-bold">included AI Assistant</span>.
-                </p>
-              </div>
+    <div className="max-w-[1440px] mx-auto w-full px-4 sm:px-6 lg:px-8 py-5 space-y-4">
+      {toast && (
+        <div
+          role="status"
+          className="fixed bottom-5 right-5 z-50 px-4 py-2.5 rounded-xl bg-zinc-900 border border-amber-500/40 text-xs font-mono text-amber-300 shadow-2xl"
+        >
+          {toast}
+        </div>
+      )}
 
-              <form name="waitlist" method="POST" data-netlify="true" className="space-y-4">
-                <input type="hidden" name="form-name" value="waitlist" />
-                <div className="space-y-2">
-                  <label className="text-[10px] text-zinc-500 font-mono uppercase tracking-widest">Email Address</label>
-                  <input
-                    type="email"
-                    name="email"
-                    required
-                    placeholder="dev@example.com"
-                    className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-zinc-700 transition-all"
-                  />
-                </div>
-                <button
-                  type="submit"
-                  className="w-full bg-zinc-100 hover:bg-white text-zinc-950 py-3 rounded-xl font-bold transition-all shadow-lg shadow-white/5"
-                >
-                  Join Waitlist
-                </button>
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+        {/* Desktop Collections & History Rail */}
+        <aside className="hidden lg:flex lg:col-span-3 flex-col rounded-2xl border border-zinc-800 bg-zinc-900/40 min-h-[640px] max-h-[780px] overflow-hidden">
+          {sidebarContent}
+        </aside>
+
+        {/* Main Request + Response Workstation */}
+        <div className="lg:col-span-9 space-y-4 min-w-0">
+          {/* Request Action Bar */}
+          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/50 p-3.5 sm:p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setShowWaitlist(false)}
-                  className="w-full text-zinc-500 hover:text-zinc-300 text-xs font-medium transition-colors"
+                  onClick={() => setMobileDrawerOpen(true)}
+                  className="lg:hidden min-h-[38px] px-3 rounded-xl border border-zinc-800 bg-zinc-950 text-zinc-200 text-xs font-medium flex items-center gap-1.5"
                 >
-                  Maybe Later
+                  <Menu size={14} />
+                  <span>Collections</span>
                 </button>
-              </form>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+                <span className="text-[11px] font-mono uppercase tracking-[0.2em] text-amber-400">
+                  HTTP Request Builder
+                </span>
+              </div>
 
-      <div className="flex-1 flex flex-col xl:flex-row min-h-0">
-        <div className="flex-1 flex flex-col min-w-0 xl:border-r border-zinc-800">
-          <div className="p-4 border-b border-zinc-800 bg-zinc-900/20">
-            <div className="flex flex-col gap-2 sm:flex-row">
-              <div className="flex-1 flex gap-2">
+              <div className="grid grid-cols-3 sm:flex items-center gap-2 w-full sm:w-auto">
+                <select
+                  value={transport}
+                  onChange={(e) => setTransport(e.target.value as TransportMode)}
+                  aria-label="Transport mode"
+                  className="min-h-[38px] bg-zinc-950 border border-zinc-800 rounded-xl px-2 sm:px-2.5 text-[11px] sm:text-xs font-mono text-zinc-200 focus:outline-none focus:border-amber-500/60 truncate"
+                >
+                  <option value="direct">Direct (CORS)</option>
+                  <option value="proxy">Server Proxy</option>
+                  <option value="mock">Offline Mock</option>
+                </select>
+
+                <button
+                  type="button"
+                  onClick={() => setCurlModalOpen(true)}
+                  className="min-h-[38px] px-2.5 sm:px-3 rounded-xl border border-zinc-800 bg-zinc-950 hover:border-amber-500/50 text-zinc-200 hover:text-amber-300 text-[11px] sm:text-xs font-medium flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap"
+                >
+                  <Terminal size={13} className="shrink-0" />
+                  <span>Import cURL</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleSaveCurrent}
+                  className="min-h-[38px] px-2.5 sm:px-3 rounded-xl border border-zinc-800 bg-zinc-950 hover:border-zinc-700 text-zinc-200 text-[11px] sm:text-xs font-medium flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap"
+                >
+                  <Bookmark size={13} className="shrink-0" />
+                  <span>Save</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-2">
+              <div className="flex gap-2 flex-1 min-w-0">
                 <select
                   value={method}
-                  onChange={(e) => setMethod(e.target.value)}
-                  className="bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-xs font-bold text-zinc-100 focus:outline-none focus:ring-2 focus:ring-zinc-600 transition-all"
+                  onChange={(e) => onChangeMethod(e.target.value)}
+                  aria-label="HTTP Method"
+                  className={cn(
+                    'min-h-[44px] bg-zinc-950 border border-zinc-800 rounded-xl px-3 text-xs font-mono font-bold focus:outline-none focus:border-amber-500/60 shrink-0',
+                    METHOD_COLORS[method] || 'text-zinc-100',
+                  )}
                 >
-                  {methods.map((m) => (
-                    <option key={m} value={m}>
+                  {METHODS.map((m) => (
+                    <option key={m} value={m} className="text-zinc-100 bg-zinc-950">
                       {m}
                     </option>
                   ))}
                 </select>
-                <div className="flex-1 relative">
-                  <Globe className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" size={14} />
-                  <input
-                    type="text"
-                    value={url}
-                    onChange={(e) => setUrl(e.target.value)}
-                    placeholder="https://api.example.com/endpoint"
-                    className="w-full bg-zinc-900 border border-zinc-800 rounded-xl py-2.5 pl-9 pr-4 text-xs text-zinc-100 font-mono focus:outline-none focus:ring-2 focus:ring-zinc-700 transition-all"
-                  />
-                </div>
-              </div>
-              <div className="flex gap-2 sm:w-auto">
-                <button
-                  onClick={() => {
-                    setUrl('');
-                    setHeaders('{\n  "Content-Type": "application/json"\n}');
-                    setBody('{}');
-                    setResponse(null);
-                    setError(null);
-                    setStatusCode(null);
+                <input
+                  type="text"
+                  value={fullUrl}
+                  onChange={(e) => handleUrlInputChange(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') handleSend();
                   }}
-                  className="flex-1 sm:flex-none p-2.5 text-zinc-600 hover:text-red-400 transition-colors border border-zinc-800 rounded-xl"
-                  title="Clear All"
-                >
-                  <Trash2 size={16} className="mx-auto" />
-                </button>
+                  placeholder="https://api.github.com/users/octocat"
+                  aria-label="Request URL"
+                  className="flex-1 min-w-0 min-h-[44px] bg-zinc-950 border border-zinc-800 rounded-xl px-3.5 text-xs sm:text-sm font-mono text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-amber-500/60"
+                />
+              </div>
+
+              <button
+                type="button"
+                onClick={() => handleSend()}
+                disabled={loading}
+                className="min-h-[44px] px-6 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-zinc-950 text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-colors shrink-0"
+              >
+                {loading ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
+                <span>Send Request</span>
+              </button>
+            </div>
+          </section>
+
+          {/* Request Configuration Tabs */}
+          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+            <div className="flex items-center gap-1 overflow-x-auto px-3 pt-2.5 border-b border-zinc-800 custom-scrollbar">
+              {(
+                [
+                  { id: 'params', label: `Query Params (${queryParams.filter((p) => p.enabled && p.key).length})` },
+                  { id: 'headers', label: `Headers (${headers.filter((h) => h.enabled && h.key).length})` },
+                  { id: 'body', label: 'JSON Body' },
+                  { id: 'code', label: 'Code Generator' },
+                  { id: 'assistant', label: 'Agent Planner' },
+                ] as const
+              ).map((tab) => (
                 <button
-                  onClick={() => sendRequest()}
-                  disabled={loading}
-                  className="flex-1 sm:flex-none bg-zinc-100 hover:bg-white disabled:bg-zinc-800 text-zinc-950 disabled:text-zinc-600 px-6 py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all shadow-lg shadow-white/5"
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setReqTab(tab.id)}
+                  className={cn(
+                    'shrink-0 px-3.5 pb-2.5 pt-1 text-xs font-medium border-b-2 transition-colors whitespace-nowrap',
+                    reqTab === tab.id
+                      ? 'border-amber-500 text-zinc-100'
+                      : 'border-transparent text-zinc-400 hover:text-zinc-200',
+                  )}
                 >
-                  {loading ? <Loader2 className="animate-spin" size={14} /> : <Send size={14} />}
-                  <span>Send</span>
+                  {tab.label}
                 </button>
-              </div>
-            </div>
-          </div>
-
-          <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-            <div className="md:hidden px-3 py-2 border-b border-zinc-800 bg-zinc-900/30">
-              <div className="grid grid-cols-3 gap-2">
-                {(['headers', 'body', 'response'] as const).map((tab) => (
-                  <button
-                    key={tab}
-                    onClick={() => setMobileWorkspaceTab(tab)}
-                    className={cn(
-                      'py-2 rounded-lg text-[11px] font-semibold uppercase tracking-wide transition-all',
-                      mobileWorkspaceTab === tab ? 'bg-zinc-100 text-zinc-950' : 'bg-zinc-900 text-zinc-400 border border-zinc-800',
-                    )}
-                  >
-                    {tab}
-                  </button>
-                ))}
-              </div>
+              ))}
             </div>
 
-            <div className="md:hidden flex-1 min-h-0">
-              {mobileWorkspaceTab === 'headers' && (
-                <div className="h-full flex flex-col min-h-0">
-                  <div className="px-4 py-2 border-b border-zinc-800 bg-zinc-900/40 flex items-center justify-between">
-                    <span className="text-[10px] text-zinc-500 font-mono uppercase tracking-widest">Headers (JSON)</span>
-                    <Shield size={12} className="text-zinc-700" />
-                  </div>
-                  <textarea
-                    value={headers}
-                    onChange={(e) => setHeaders(e.target.value)}
-                    className="flex-1 bg-zinc-950 p-4 text-xs text-emerald-400 font-mono resize-none focus:outline-none custom-scrollbar"
-                    spellCheck={false}
-                  />
-                </div>
-              )}
-
-              {mobileWorkspaceTab === 'body' && (
-                <div className="h-full flex flex-col min-h-0">
-                  <div className="px-4 py-2 border-b border-zinc-800 bg-zinc-900/40 flex items-center justify-between">
-                    <span className="text-[10px] text-zinc-500 font-mono uppercase tracking-widest">Body (JSON)</span>
-                    <Code2 size={12} className="text-zinc-700" />
-                  </div>
-                  <textarea
-                    value={body}
-                    onChange={(e) => setBody(e.target.value)}
-                    disabled={method === 'GET'}
-                    className={cn(
-                      'flex-1 bg-zinc-950 p-4 text-xs text-blue-400 font-mono resize-none focus:outline-none custom-scrollbar',
-                      method === 'GET' && 'opacity-50 cursor-not-allowed',
-                    )}
-                    spellCheck={false}
-                  />
-                </div>
-              )}
-
-              {mobileWorkspaceTab === 'response' && (
-                <div className="h-full flex flex-col min-h-0 relative">
-                  <div className="px-4 py-2 border-b border-zinc-800 bg-zinc-900/40 flex items-center justify-between sticky top-0 z-10">
-                    <div className="flex items-center gap-4">
-                      <span className="text-[10px] text-zinc-500 font-mono uppercase tracking-widest">Response</span>
-                      {statusCode && (
-                        <span
-                          className={cn(
-                            'text-[10px] font-mono',
-                            statusCode >= 200 && statusCode < 300 ? 'text-emerald-500' : 'text-amber-500',
-                          )}
-                        >
-                          {statusCode}
-                        </span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button onClick={copyToClipboard} className="p-1.5 text-zinc-600 hover:text-zinc-400 transition-colors">
-                        {copied ? <Check size={14} className="text-emerald-500" /> : <Copy size={14} />}
-                      </button>
-                      <button
-                        onClick={() => {
-                          setResponse(null);
-                          setStatusCode(null);
-                        }}
-                        className="p-1.5 text-zinc-600 hover:text-red-400 transition-colors"
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
-                  </div>
-                  <div className="flex-1 bg-zinc-950 overflow-auto p-4 custom-scrollbar">
-                    {loading ? (
-                      <div className="h-full flex flex-col items-center justify-center gap-3 text-zinc-700">
-                        <Loader2 className="animate-spin" size={24} />
-                        <span className="text-[10px] font-mono uppercase tracking-widest">Waiting for response...</span>
-                      </div>
-                    ) : error ? (
-                      <div className="p-4 bg-red-500/5 border border-red-500/20 rounded-xl flex items-start gap-3">
-                        <AlertCircle size={16} className="text-red-500 shrink-0 mt-0.5" />
-                        <div className="space-y-1">
-                          <p className="text-xs font-bold text-red-400 font-mono uppercase">Request Error</p>
-                          <p className="text-xs text-zinc-400 font-mono leading-relaxed">{error}</p>
-                        </div>
-                      </div>
-                    ) : response ? (
-                      <pre className="text-xs text-zinc-300 font-mono whitespace-pre-wrap">{JSON.stringify(response, null, 2)}</pre>
-                    ) : (
-                      <div className="h-full flex flex-col items-center justify-center text-zinc-800 gap-2">
-                        <Terminal size={32} strokeWidth={1} />
-                        <p className="text-[10px] font-mono uppercase tracking-widest">No request sent yet</p>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className="hidden md:grid flex-1 grid-rows-2 min-h-0">
-              <div className="grid grid-cols-1 md:grid-cols-2 border-b border-zinc-800 min-h-0">
-                <div className="flex flex-col border-r border-zinc-800 min-h-0">
-                  <div className="px-4 py-2 border-b border-zinc-800 bg-zinc-900/40 flex items-center justify-between">
-                    <span className="text-[10px] text-zinc-500 font-mono uppercase tracking-widest">Headers (JSON)</span>
-                    <Shield size={12} className="text-zinc-700" />
-                  </div>
-                  <textarea
-                    value={headers}
-                    onChange={(e) => setHeaders(e.target.value)}
-                    className="flex-1 bg-zinc-950 p-4 text-xs text-emerald-400 font-mono resize-none focus:outline-none custom-scrollbar"
-                    spellCheck={false}
-                  />
-                </div>
-                <div className="flex flex-col min-h-0">
-                  <div className="px-4 py-2 border-b border-zinc-800 bg-zinc-900/40 flex items-center justify-between">
-                    <span className="text-[10px] text-zinc-500 font-mono uppercase tracking-widest">Body (JSON)</span>
-                    <Code2 size={12} className="text-zinc-700" />
-                  </div>
-                  <textarea
-                    value={body}
-                    onChange={(e) => setBody(e.target.value)}
-                    disabled={method === 'GET'}
-                    className={cn(
-                      'flex-1 bg-zinc-950 p-4 text-xs text-blue-400 font-mono resize-none focus:outline-none custom-scrollbar',
-                      method === 'GET' && 'opacity-50 cursor-not-allowed',
-                    )}
-                    spellCheck={false}
-                  />
-                </div>
-              </div>
-
-              <div className="flex flex-col min-h-0 relative">
-                <div className="px-4 py-2 border-b border-zinc-800 bg-zinc-900/40 flex items-center justify-between sticky top-0 z-10">
-                  <div className="flex items-center gap-4">
-                    <span className="text-[10px] text-zinc-500 font-mono uppercase tracking-widest">Response</span>
-                    {statusCode && (
-                      <span
-                        className={cn(
-                          'text-[10px] font-mono',
-                          statusCode >= 200 && statusCode < 300 ? 'text-emerald-500' : 'text-amber-500',
-                        )}
-                      >
-                        {statusCode}
-                      </span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button onClick={copyToClipboard} className="p-1.5 text-zinc-600 hover:text-zinc-400 transition-colors">
-                      {copied ? <Check size={14} className="text-emerald-500" /> : <Copy size={14} />}
-                    </button>
+            <div className="p-4 min-h-[220px]">
+              {/* Query Params Tab */}
+              {reqTab === 'params' && (
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs text-zinc-400">
+                      Synced live with the URL query string above.
+                    </p>
                     <button
-                      onClick={() => {
-                        setResponse(null);
-                        setStatusCode(null);
-                      }}
-                      className="p-1.5 text-zinc-600 hover:text-red-400 transition-colors"
+                      type="button"
+                      onClick={() =>
+                        onChangeQueryParams([
+                          ...queryParams,
+                          { id: `qp-${Date.now()}`, key: '', value: '', enabled: true },
+                        ])
+                      }
+                      className="min-h-[36px] px-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100 text-xs font-medium flex items-center gap-1.5 whitespace-nowrap shrink-0"
                     >
-                      <Trash2 size={14} />
+                      <Plus size={13} />
+                      <span>Add Param</span>
                     </button>
                   </div>
-                </div>
-                <div className="flex-1 bg-zinc-950 overflow-auto p-4 custom-scrollbar">
-                  {loading ? (
-                    <div className="h-full flex flex-col items-center justify-center gap-3 text-zinc-700">
-                      <Loader2 className="animate-spin" size={24} />
-                      <span className="text-[10px] font-mono uppercase tracking-widest">Waiting for response...</span>
+
+                  {queryParams.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-zinc-800 py-8 text-center text-xs text-zinc-500">
+                      No query parameters. Click &ldquo;Add Param&rdquo; or append <code className="text-zinc-300">?key=value</code> to the URL.
                     </div>
-                  ) : error ? (
-                    <div className="p-4 bg-red-500/5 border border-red-500/20 rounded-xl flex items-start gap-3">
-                      <AlertCircle size={16} className="text-red-500 shrink-0 mt-0.5" />
-                      <div className="space-y-1">
-                        <p className="text-xs font-bold text-red-400 font-mono uppercase">Request Error</p>
-                        <p className="text-xs text-zinc-400 font-mono leading-relaxed">{error}</p>
-                      </div>
-                    </div>
-                  ) : response ? (
-                    <pre className="text-xs text-zinc-300 font-mono whitespace-pre-wrap">{JSON.stringify(response, null, 2)}</pre>
                   ) : (
-                    <div className="h-full flex flex-col items-center justify-center text-zinc-800 gap-2">
-                      <Terminal size={32} strokeWidth={1} />
-                      <p className="text-[10px] font-mono uppercase tracking-widest">No request sent yet</p>
+                    <div className="space-y-2">
+                      {queryParams.map((param) => (
+                        <div key={param.id} className="flex flex-wrap sm:flex-nowrap items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={param.enabled}
+                            onChange={(e) =>
+                              onChangeQueryParams(
+                                queryParams.map((p) =>
+                                  p.id === param.id ? { ...p, enabled: e.target.checked } : p,
+                                ),
+                              )
+                            }
+                            aria-label="Enable parameter"
+                            className="w-4 h-4 accent-amber-500 shrink-0"
+                          />
+                          <input
+                            type="text"
+                            value={param.key}
+                            onChange={(e) =>
+                              onChangeQueryParams(
+                                queryParams.map((p) =>
+                                  p.id === param.id ? { ...p, key: e.target.value } : p,
+                                ),
+                              )
+                            }
+                            placeholder="key"
+                            className="flex-1 min-w-[120px] min-h-[38px] bg-zinc-950 border border-zinc-800 rounded-lg px-3 text-xs font-mono text-zinc-100"
+                          />
+                          <input
+                            type="text"
+                            value={param.value}
+                            onChange={(e) =>
+                              onChangeQueryParams(
+                                queryParams.map((p) =>
+                                  p.id === param.id ? { ...p, value: e.target.value } : p,
+                                ),
+                              )
+                            }
+                            placeholder="value"
+                            className="flex-1 min-w-[120px] min-h-[38px] bg-zinc-950 border border-zinc-800 rounded-lg px-3 text-xs font-mono text-emerald-300"
+                          />
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onChangeQueryParams(queryParams.filter((p) => p.id !== param.id))
+                            }
+                            aria-label="Remove query parameter"
+                            className="p-2 text-zinc-500 hover:text-rose-400"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div className="hidden xl:flex xl:w-[420px] 2xl:w-[460px] shrink-0 flex-col bg-zinc-900/30 backdrop-blur-xl border-l border-zinc-800">
-          <div className="p-5 border-b border-zinc-800 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-400/20 flex items-center justify-center">
-                <BrainCircuit size={16} className="text-amber-500" />
-              </div>
-              <div>
-                <h3 className="text-sm font-bold text-zinc-100 tracking-tight">AI Agent</h3>
-                <p className="text-[11px] text-zinc-500">Plans and can run requests for you</p>
-              </div>
-            </div>
-            <button
-              onClick={() => setShowSettings(!showSettings)}
-              className={cn(
-                'p-2 rounded-lg transition-all',
-                showSettings ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-600 hover:text-zinc-400',
               )}
-            >
-              <Settings size={15} />
-            </button>
-          </div>
-          {aiPanelBody}
+
+              {/* Headers Tab */}
+              {reqTab === 'headers' && (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => addHeaderPreset('json')}
+                        className="px-2.5 py-1 rounded-lg border border-zinc-800 bg-zinc-950 hover:border-zinc-700 text-[11px] font-mono text-zinc-300"
+                      >
+                        + JSON Content-Type
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => addHeaderPreset('bearer')}
+                        className="px-2.5 py-1 rounded-lg border border-zinc-800 bg-zinc-950 hover:border-zinc-700 text-[11px] font-mono text-zinc-300"
+                      >
+                        + Bearer Auth
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => addHeaderPreset('apikey')}
+                        className="px-2.5 py-1 rounded-lg border border-zinc-800 bg-zinc-950 hover:border-zinc-700 text-[11px] font-mono text-zinc-300"
+                      >
+                        + X-API-Key
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onChangeHeaders([
+                          ...headers,
+                          { id: `h-${Date.now()}`, key: '', value: '', enabled: true },
+                        ])
+                      }
+                      className="min-h-[34px] px-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100 text-xs font-medium flex items-center gap-1"
+                    >
+                      <Plus size={13} />
+                      <span>Add Header</span>
+                    </button>
+                  </div>
+
+                  <div className="space-y-2">
+                    {headers.map((hdr) => (
+                      <div key={hdr.id} className="flex flex-wrap sm:flex-nowrap items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={hdr.enabled}
+                          onChange={(e) =>
+                            onChangeHeaders(
+                              headers.map((h) =>
+                                h.id === hdr.id ? { ...h, enabled: e.target.checked } : h,
+                              ),
+                            )
+                          }
+                          aria-label="Enable header"
+                          className="w-4 h-4 accent-amber-500 shrink-0"
+                        />
+                        <input
+                          type="text"
+                          value={hdr.key}
+                          onChange={(e) =>
+                            onChangeHeaders(
+                              headers.map((h) =>
+                                h.id === hdr.id ? { ...h, key: e.target.value } : h,
+                              ),
+                            )
+                          }
+                          placeholder="Header-Name"
+                          className="flex-1 min-w-[120px] min-h-[38px] bg-zinc-950 border border-zinc-800 rounded-lg px-3 text-xs font-mono text-zinc-100"
+                        />
+                        <input
+                          type="text"
+                          value={hdr.value}
+                          onChange={(e) =>
+                            onChangeHeaders(
+                              headers.map((h) =>
+                                h.id === hdr.id ? { ...h, value: e.target.value } : h,
+                              ),
+                            )
+                          }
+                          placeholder="value"
+                          className="flex-1 min-w-[120px] min-h-[38px] bg-zinc-950 border border-zinc-800 rounded-lg px-3 text-xs font-mono text-emerald-300"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => onChangeHeaders(headers.filter((h) => h.id !== hdr.id))}
+                          aria-label="Remove header"
+                          className="p-2 text-zinc-500 hover:text-rose-400"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Body Tab */}
+              {reqTab === 'body' && (
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs text-zinc-400">
+                      {['GET', 'HEAD'].includes(method)
+                        ? `${method} requests do not transmit a body. Switch method to POST/PUT/PATCH to send JSON.`
+                        : 'JSON request payload'}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={!body.trim()}
+                      onClick={() => {
+                        try {
+                          onChangeBody(JSON.stringify(JSON.parse(body), null, 2));
+                          showToast('Formatted JSON body');
+                        } catch {
+                          showToast('Cannot format: invalid JSON');
+                        }
+                      }}
+                      className="min-h-[32px] px-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 text-zinc-100 text-xs font-medium"
+                    >
+                      Format JSON
+                    </button>
+                  </div>
+
+                  <textarea
+                    value={body}
+                    onChange={(e) => onChangeBody(e.target.value)}
+                    disabled={['GET', 'HEAD'].includes(method)}
+                    rows={7}
+                    spellCheck={false}
+                    placeholder='{\n  "title": "Hello Nexus",\n  "userId": 1\n}'
+                    className={cn(
+                      'w-full bg-zinc-950 border border-zinc-800 rounded-xl p-3.5 text-xs font-mono text-sky-300 focus:outline-none focus:border-amber-500/60',
+                      ['GET', 'HEAD'].includes(method) && 'opacity-50 cursor-not-allowed',
+                    )}
+                  />
+                  {bodyJsonError && (
+                    <p className="text-xs font-mono text-amber-400">JSON Warning: {bodyJsonError}</p>
+                  )}
+                </div>
+              )}
+
+              {/* Code Generator Tab */}
+              {reqTab === 'code' && (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {(
+                        [
+                          { id: 'curl', label: 'cURL' },
+                          { id: 'fetch', label: 'JavaScript fetch' },
+                          { id: 'python', label: 'Python requests' },
+                          { id: 'httpie', label: 'HTTPie' },
+                        ] as const
+                      ).map((lang) => (
+                        <button
+                          key={lang.id}
+                          type="button"
+                          onClick={() => setCodeLang(lang.id)}
+                          className={cn(
+                            'min-h-[34px] px-3 rounded-lg text-xs font-mono font-medium transition-colors',
+                            codeLang === lang.id
+                              ? 'bg-amber-500 text-zinc-950 font-bold'
+                              : 'bg-zinc-950 border border-zinc-800 text-zinc-300 hover:border-zinc-700',
+                          )}
+                        >
+                          {lang.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(codeSnippet).catch(() => {});
+                        setCopiedCode(true);
+                        setTimeout(() => setCopiedCode(false), 1800);
+                      }}
+                      className="min-h-[34px] px-3.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-100 text-xs font-medium flex items-center gap-1.5"
+                    >
+                      {copiedCode ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
+                      <span>{copiedCode ? 'Copied' : 'Copy Snippet'}</span>
+                    </button>
+                  </div>
+
+                  <pre className="p-4 rounded-xl bg-zinc-950 border border-zinc-800 text-xs font-mono text-emerald-300 overflow-x-auto whitespace-pre leading-relaxed">
+                    {codeSnippet}
+                  </pre>
+                </div>
+              )}
+
+              {/* Agent Planner Tab */}
+              {reqTab === 'assistant' && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-xs text-zinc-300">
+                      <Wand2 size={14} className="text-amber-400" />
+                      <span>
+                        {geminiKey.trim()
+                          ? 'BYOK Gemini Planner active (browser-local key)'
+                          : 'Zero-Key Local Planner active — works 100% offline'}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowByokSettings((v) => !v)}
+                      className="min-h-[32px] px-2.5 rounded-lg border border-zinc-800 bg-zinc-950 text-xs text-zinc-400 hover:text-zinc-200 flex items-center gap-1.5"
+                    >
+                      <Settings size={12} />
+                      <span>Optional API Key</span>
+                    </button>
+                  </div>
+
+                  {showByokSettings && (
+                    <div className="p-3 rounded-xl border border-zinc-800 bg-zinc-950 space-y-2">
+                      <label className="block text-[11px] font-mono text-zinc-400">
+                        Optional Gemini API Key (stored only in your browser localStorage)
+                      </label>
+                      <input
+                        type="password"
+                        value={geminiKey}
+                        onChange={(e) => {
+                          setGeminiKey(e.target.value);
+                          if (e.target.value) {
+                            window.localStorage.setItem(GEMINI_KEY_STORAGE, e.target.value);
+                          } else {
+                            window.localStorage.removeItem(GEMINI_KEY_STORAGE);
+                          }
+                        }}
+                        placeholder="Leave blank to use the free local planner"
+                        className="w-full min-h-[38px] bg-zinc-900 border border-zinc-800 rounded-lg px-3 text-xs font-mono text-zinc-200"
+                      />
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap gap-1.5">
+                    {[
+                      'GET github user 1nc0gn30',
+                      'Create a POST jsonplaceholder request with JSON body',
+                      'Add Bearer auth and Accept headers',
+                      'Fetch weather forecast from Open-Meteo',
+                    ].map((quick) => (
+                      <button
+                        key={quick}
+                        type="button"
+                        onClick={() => setAgentPrompt(quick)}
+                        className="px-2.5 py-1.5 rounded-lg border border-zinc-800 bg-zinc-950 hover:border-amber-500/40 text-[11px] text-zinc-300 transition-colors"
+                      >
+                        {quick}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <input
+                      type="text"
+                      value={agentPrompt}
+                      onChange={(e) => setAgentPrompt(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleRunAssistant();
+                      }}
+                      placeholder="Describe a request, paste a URL, or paste a cURL command..."
+                      className="flex-1 min-h-[42px] bg-zinc-950 border border-zinc-800 rounded-xl px-3.5 text-xs text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-amber-500/60"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleRunAssistant}
+                      disabled={agentLoading || !agentPrompt.trim()}
+                      className="min-h-[42px] px-4 rounded-xl bg-zinc-100 hover:bg-white disabled:opacity-40 text-zinc-950 text-xs font-bold flex items-center justify-center gap-1.5"
+                    >
+                      {agentLoading ? (
+                        <Loader2 size={14} className="animate-spin" />
+                      ) : (
+                        <Sparkles size={14} />
+                      )}
+                      <span>Build Request</span>
+                    </button>
+                  </div>
+
+                  {agentOutput && (
+                    <div className="p-3.5 rounded-xl border border-amber-500/30 bg-amber-500/5 space-y-1.5">
+                      <p className="text-xs text-zinc-200">{agentOutput.explanation}</p>
+                      {agentOutput.nextSteps.length > 0 && (
+                        <ul className="text-[11px] text-zinc-400 list-disc pl-4 space-y-0.5">
+                          {agentOutput.nextSteps.map((s, i) => (
+                            <li key={i}>{s}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+
+          {/* Response Inspector */}
+          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+            <div className="px-4 py-3 border-b border-zinc-800 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <span className="text-[11px] font-mono uppercase tracking-[0.2em] text-zinc-400">
+                  Response
+                </span>
+                {result && (
+                  <>
+                    <span
+                      className={cn(
+                        'px-2 py-0.5 rounded-md text-xs font-mono font-semibold border',
+                        result.ok
+                          ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                          : 'bg-rose-500/10 border-rose-500/30 text-rose-300',
+                      )}
+                    >
+                      {result.status || 'ERR'} {result.statusText}
+                    </span>
+                    <span className="text-xs font-mono text-zinc-400">{result.durationMs} ms</span>
+                    <span className="text-xs font-mono text-zinc-500">
+                      {formatBytes(result.sizeBytes)}
+                    </span>
+                    <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded bg-zinc-800 text-zinc-300">
+                      {result.transportUsed}
+                    </span>
+                  </>
+                )}
+              </div>
+
+              <div className="flex items-center gap-1.5">
+                {(['tree', 'raw', 'headers'] as const).map((tab) => (
+                  <button
+                    key={tab}
+                    type="button"
+                    onClick={() => setResTab(tab)}
+                    className={cn(
+                      'px-2.5 py-1 rounded-lg text-xs font-medium capitalize transition-colors',
+                      resTab === tab
+                        ? 'bg-zinc-800 text-zinc-100'
+                        : 'text-zinc-400 hover:text-zinc-200',
+                    )}
+                  >
+                    {tab === 'tree' ? 'JSON Tree' : tab === 'raw' ? 'Raw' : 'Headers'}
+                  </button>
+                ))}
+                {result && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const text =
+                          typeof result.data === 'string'
+                            ? result.data
+                            : JSON.stringify(result.data, null, 2);
+                        navigator.clipboard.writeText(text).catch(() => {});
+                        setCopiedRes(true);
+                        setTimeout(() => setCopiedRes(false), 1800);
+                      }}
+                      aria-label="Copy response body"
+                      className="p-1.5 rounded-lg text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800"
+                    >
+                      {copiedRes ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setResult(null)}
+                      aria-label="Clear response"
+                      className="p-1.5 rounded-lg text-zinc-400 hover:text-rose-400 hover:bg-zinc-800"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            <div className="p-4 min-h-[260px] max-h-[420px] overflow-auto bg-zinc-950/70 custom-scrollbar">
+              {loading ? (
+                <div className="h-56 flex flex-col items-center justify-center gap-2 text-zinc-500">
+                  <Loader2 size={22} className="animate-spin text-amber-400" />
+                  <span className="text-xs font-mono">Executing {method} request…</span>
+                </div>
+              ) : !result ? (
+                <div className="h-56 flex flex-col items-center justify-center gap-3 text-center px-4">
+                  <FileCode2 size={28} strokeWidth={1.3} className="text-zinc-600" />
+                  <div className="space-y-1">
+                    <p className="text-sm font-medium text-zinc-300">Ready to inspect live JSON</p>
+                    <p className="text-xs text-zinc-500 max-w-md">
+                      Click <strong className="text-zinc-300">Send Request</strong> for a live CORS call,
+                      switch to <strong className="text-zinc-300">Offline Mock</strong> for instant schema
+                      testing, or paste a command via <strong className="text-zinc-300">Import cURL</strong>.
+                    </p>
+                  </div>
+                </div>
+              ) : result.error && result.data === null ? (
+                <div className="p-4 rounded-xl border border-rose-500/30 bg-rose-500/5 flex items-start gap-3">
+                  <AlertCircle size={16} className="text-rose-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <p className="text-xs font-mono font-semibold text-rose-300 uppercase">
+                      Request Failed
+                    </p>
+                    <p className="text-xs font-mono text-zinc-300 leading-relaxed">{result.error}</p>
+                  </div>
+                </div>
+              ) : resTab === 'headers' ? (
+                <div className="space-y-1.5">
+                  {Object.keys(result.responseHeaders).length === 0 ? (
+                    <p className="text-xs font-mono text-zinc-500">
+                      No response headers exposed by browser CORS policy.
+                    </p>
+                  ) : (
+                    Object.entries(result.responseHeaders).map(([k, v]) => (
+                      <div
+                        key={k}
+                        className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4 py-1.5 border-b border-zinc-900 text-xs font-mono"
+                      >
+                        <span className="text-amber-300 sm:w-52 shrink-0">{k}</span>
+                        <span className="text-zinc-300 break-all">{v}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              ) : resTab === 'raw' ? (
+                <pre className="text-xs font-mono text-zinc-200 whitespace-pre-wrap break-words leading-relaxed">
+                  {typeof result.data === 'string'
+                    ? result.data
+                    : JSON.stringify(result.data, null, 2)}
+                </pre>
+              ) : typeof result.data === 'object' && result.data !== null ? (
+                <JsonTree
+                  data={result.data}
+                  onCopyPath={(expr) => {
+                    navigator.clipboard.writeText(expr).catch(() => {});
+                    showToast(`Copied ${expr}`);
+                  }}
+                />
+              ) : (
+                <pre className="text-xs font-mono text-zinc-200 whitespace-pre-wrap break-words">
+                  {String(result.data ?? '')}
+                </pre>
+              )}
+            </div>
+          </section>
         </div>
       </div>
 
-      <button
-        onClick={() => setShowMobileAgentPanel(true)}
-        className="xl:hidden fixed bottom-4 right-4 z-40 bg-zinc-100 text-zinc-950 px-4 py-2.5 rounded-xl text-xs font-bold shadow-lg shadow-black/30"
-      >
-        Open AI Agent
-      </button>
-
-      <AnimatePresence>
-        {showMobileAgentPanel && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="xl:hidden fixed inset-0 z-50 bg-zinc-950/80 backdrop-blur-sm"
-            onClick={() => setShowMobileAgentPanel(false)}
+      {/* Mobile Collections Drawer */}
+      {mobileDrawerOpen && (
+        <div
+          className="lg:hidden fixed inset-0 z-50 bg-zinc-950/80 backdrop-blur-sm flex"
+          onClick={() => setMobileDrawerOpen(false)}
+        >
+          <div
+            className="w-80 max-w-[88vw] bg-zinc-900 border-r border-zinc-800 h-full flex flex-col"
+            onClick={(e) => e.stopPropagation()}
           >
-            <motion.div
-              initial={{ y: '100%' }}
-              animate={{ y: 0 }}
-              exit={{ y: '100%' }}
-              transition={{ type: 'spring', damping: 30, stiffness: 260 }}
-              className="absolute inset-x-0 bottom-0 h-[86vh] bg-zinc-900 border-t border-zinc-800 rounded-t-2xl flex flex-col"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="p-4 border-b border-zinc-800 flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-400/20 flex items-center justify-center">
-                    <BrainCircuit size={16} className="text-amber-500" />
-                  </div>
-                  <div>
-                    <h3 className="text-sm font-bold text-zinc-100 tracking-tight">AI Agent</h3>
-                    <p className="text-[11px] text-zinc-500">Mobile agent workspace</p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setShowSettings(!showSettings)}
-                    className={cn(
-                      'p-2 rounded-lg transition-all',
-                      showSettings ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-600 hover:text-zinc-400',
-                    )}
-                  >
-                    <Settings size={15} />
-                  </button>
-                  <button
-                    onClick={() => setShowMobileAgentPanel(false)}
-                    className="p-2 rounded-lg text-zinc-500 hover:text-zinc-200 transition-colors"
-                  >
-                    <X size={15} />
-                  </button>
-                </div>
+            <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
+              <span className="text-xs font-mono uppercase tracking-widest text-zinc-300">
+                Workspace
+              </span>
+              <button
+                type="button"
+                onClick={() => setMobileDrawerOpen(false)}
+                aria-label="Close workspace drawer"
+                className="p-1.5 text-zinc-400 hover:text-zinc-100"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="flex-1 min-h-0">{sidebarContent}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Import cURL Modal */}
+      {curlModalOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-zinc-950/80 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setCurlModalOpen(false)}
+        >
+          <div
+            className="w-full max-w-xl rounded-2xl border border-zinc-800 bg-zinc-900 p-5 space-y-4 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Code2 size={16} className="text-amber-400" />
+                <h3 className="text-base font-display font-semibold text-zinc-100">
+                  Import cURL Command
+                </h3>
               </div>
-              {aiPanelBody}
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+              <button
+                type="button"
+                onClick={() => setCurlModalOpen(false)}
+                aria-label="Close cURL modal"
+                className="p-1.5 rounded-lg text-zinc-400 hover:text-zinc-100"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="flex flex-wrap gap-1.5">
+              {SAMPLE_CURL_PRESETS.map((preset) => (
+                <button
+                  key={preset.label}
+                  type="button"
+                  onClick={() => {
+                    setCurlInput(preset.cmd);
+                    setCurlError(null);
+                  }}
+                  className="px-2.5 py-1 rounded-lg border border-zinc-800 bg-zinc-950 hover:border-amber-500/40 text-[11px] font-mono text-zinc-300"
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+
+            <textarea
+              value={curlInput}
+              onChange={(e) => setCurlInput(e.target.value)}
+              rows={6}
+              spellCheck={false}
+              placeholder={`curl -X POST 'https://jsonplaceholder.typicode.com/posts' \\\n  -H 'Content-Type: application/json' \\\n  -d '{"title":"hello"}'`}
+              className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-3.5 text-xs font-mono text-emerald-300 placeholder:text-zinc-600 focus:outline-none focus:border-amber-500/60"
+            />
+
+            {curlError && <p className="text-xs font-mono text-rose-400">{curlError}</p>}
+
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setCurlModalOpen(false)}
+                className="min-h-[40px] px-4 rounded-xl border border-zinc-800 text-xs font-medium text-zinc-300 hover:text-zinc-100"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleImportCurl}
+                className="min-h-[40px] px-5 rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 text-xs font-bold"
+              >
+                Parse & Populate IDE
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

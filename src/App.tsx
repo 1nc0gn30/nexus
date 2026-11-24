@@ -1,216 +1,356 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useEffect } from 'react';
 import { initialRegistry, PublicAPI } from './data/registry';
-import { CategoryScreener } from './components/CategoryScreener';
-import { UniversalFetcher } from './components/UniversalFetcher';
 import { ApiIde } from './components/ApiIde';
-import { VoiceSearch } from './components/VoiceSearch';
-import { Search, LayoutGrid, Code2, Database, Zap, Info, Github, Sparkles, Terminal } from 'lucide-react';
+import { CatalogView } from './components/CatalogView';
+import { WorkflowBuilder } from './components/WorkflowBuilder';
+import { extractQueryParams, KeyValueItem } from './lib/curlParser';
+import {
+  loadCollections,
+  saveCollections,
+  loadWorkflows,
+  saveWorkflows,
+  loadHistory,
+  saveHistory,
+  exportWorkspaceJson,
+  importWorkspaceJson,
+  SavedCollection,
+  SavedRequest,
+  RequestHistoryItem,
+} from './lib/collections';
+import { WorkflowDefinition } from './lib/workflowEngine';
+import {
+  Terminal,
+  LayoutGrid,
+  GitBranch,
+  Coffee,
+  Github,
+  Copy,
+  Check,
+  Database,
+} from 'lucide-react';
 import { cn } from './lib/utils';
-import { motion, AnimatePresence } from 'motion/react';
+
+type WorkspaceView = 'ide' | 'catalog' | 'workflows';
+
+const STRIPE_COFFEE_URL = 'https://buy.stripe.com/3cIfZg27PdKo2D64Ocfw40X';
+const SOLANA_TIP_ADDRESS = 'GG2eQbVh8ut1BK6j1A2tz7pSySdLpD38BgyEhGcxdXoK';
 
 export default function App() {
-  const [searchQuery, setSearchQuery] = useState('');
-  const [activeCategory, setActiveCategory] = useState('All');
-  const [viewMode, setViewMode] = useState<'card' | 'dev'>('card');
-  const [currentView, setCurrentView] = useState<'discovery' | 'ide'>('discovery');
-  const [ideConfig, setIdeConfig] = useState<{ url?: string; method?: string }>({});
+  const [activeView, setActiveView] = useState<WorkspaceView>('ide');
+
+  // Shared IDE Request State
+  const [method, setMethod] = useState('GET');
+  const [baseUrl, setBaseUrl] = useState('https://jsonplaceholder.typicode.com/todos/1');
+  const [queryParams, setQueryParams] = useState<KeyValueItem[]>([]);
+  const [headers, setHeaders] = useState<KeyValueItem[]>([
+    { id: 'init-accept', key: 'Accept', value: 'application/json', enabled: true },
+  ]);
+  const [body, setBody] = useState(
+    JSON.stringify({ title: 'Nexus API Test', body: 'In-browser payload', userId: 1 }, null, 2),
+  );
+
+  // Persisted Collections, Workflows, History
+  const [collections, setCollections] = useState<SavedCollection[]>(() => loadCollections());
+  const [workflows, setWorkflows] = useState<WorkflowDefinition[]>(() => loadWorkflows());
+  const [history, setHistory] = useState<RequestHistoryItem[]>(() => loadHistory());
+  const [copiedSolana, setCopiedSolana] = useState(false);
+
+  useEffect(() => {
+    saveCollections(collections);
+  }, [collections]);
+
+  useEffect(() => {
+    saveWorkflows(workflows);
+  }, [workflows]);
+
+  useEffect(() => {
+    saveHistory(history);
+  }, [history]);
 
   const handleOpenInIde = (api: PublicAPI) => {
-    setIdeConfig({ url: api.Link, method: 'GET' });
-    setCurrentView('ide');
+    const { baseUrl: nextBase, params } = extractQueryParams(api.Link);
+    setMethod('GET');
+    setBaseUrl(nextBase);
+    setQueryParams(params);
+    setHeaders([{ id: `h-${Date.now()}`, key: 'Accept', value: 'application/json', enabled: true }]);
+    setActiveView('ide');
   };
 
-  const categories = useMemo(() => {
-    const cats = Array.from(new Set(initialRegistry.map(api => api.Category)));
-    return cats.sort();
-  }, []);
-
-  const filteredAPIs = useMemo(() => {
-    return initialRegistry.filter(api => {
-      const matchesSearch = api.API.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                          api.Description.toLowerCase().includes(searchQuery.toLowerCase());
-      const matchesCategory = activeCategory === 'All' || api.Category === activeCategory;
-      return matchesSearch && matchesCategory;
+  const handleAddToWorkflow = (api: PublicAPI) => {
+    setWorkflows((prev) => {
+      if (prev.length === 0) return prev;
+      const target = prev[0];
+      const nextIdx = target.steps.length + 1;
+      const updatedFirst: WorkflowDefinition = {
+        ...target,
+        steps: [
+          ...target.steps,
+          {
+            id: `wf-add-${Date.now()}`,
+            alias: `step${nextIdx}`,
+            name: api.API,
+            method: 'GET',
+            url: api.Link,
+            headers: [{ id: `wh-${Date.now()}`, key: 'Accept', value: 'application/json', enabled: true }],
+            body: '',
+          },
+        ],
+      };
+      return [updatedFirst, ...prev.slice(1)];
     });
-  }, [searchQuery, activeCategory]);
+    setActiveView('workflows');
+  };
+
+  const handleSaveRequest = (collectionId: string, req: SavedRequest) => {
+    setCollections((prev) =>
+      prev.map((col) =>
+        col.id === collectionId ? { ...col, requests: [req, ...col.requests] } : col,
+      ),
+    );
+  };
+
+  const handleDeleteSavedRequest = (collectionId: string, reqId: string) => {
+    setCollections((prev) =>
+      prev.map((col) =>
+        col.id === collectionId
+          ? { ...col, requests: col.requests.filter((r) => r.id !== reqId) }
+          : col,
+      ),
+    );
+  };
+
+  const handleLoadSavedRequest = (req: SavedRequest) => {
+    setMethod(req.method);
+    setBaseUrl(req.baseUrl);
+    setQueryParams(req.queryParams);
+    setHeaders(req.headers);
+    setBody(req.body);
+  };
+
+  const handleExportWorkspace = () => {
+    const json = exportWorkspaceJson(collections, workflows);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'nexus-api-workspace.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportWorkspace = (rawJson: string): { ok: boolean; message: string } => {
+    try {
+      const imported = importWorkspaceJson(rawJson);
+      if (imported.collections.length > 0) setCollections(imported.collections);
+      if (imported.workflows.length > 0) setWorkflows(imported.workflows);
+      return {
+        ok: true,
+        message: `Imported ${imported.collections.length} collection(s) and ${imported.workflows.length} workflow(s).`,
+      };
+    } catch (err: unknown) {
+      return {
+        ok: false,
+        message: err instanceof Error ? err.message : 'Failed to import JSON workspace.',
+      };
+    }
+  };
+
+  const handleCopySolana = () => {
+    navigator.clipboard.writeText(SOLANA_TIP_ADDRESS).catch(() => {});
+    setCopiedSolana(true);
+    setTimeout(() => setCopiedSolana(false), 2000);
+  };
 
   return (
-    <div className="min-h-screen bg-zinc-950 flex flex-col md:flex-row overflow-hidden">
-      {/* Sidebar */}
-      <aside className="w-full md:w-72 border-b md:border-b-0 md:border-r border-zinc-800 p-4 md:p-6 flex flex-col gap-4 md:gap-8 bg-zinc-950/50 backdrop-blur-xl z-20">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-zinc-100 rounded-xl flex items-center justify-center shadow-lg shadow-zinc-100/10">
-            <Database className="text-zinc-950" size={24} />
-          </div>
-          <div>
-            <h1 className="text-lg font-black tracking-tighter text-zinc-100 uppercase">Nexus</h1>
-            <p className="text-[10px] text-zinc-500 font-mono tracking-widest uppercase">API Explorer</p>
-          </div>
-        </div>
-
-        <div className="flex-1 flex flex-col gap-6">
-          <div className="flex flex-col gap-2">
-            <h2 className="text-[10px] text-zinc-600 font-mono uppercase tracking-widest px-3">Mode</h2>
-            <div className="flex flex-col gap-1">
-              <button 
-                onClick={() => setCurrentView('discovery')}
-                className={cn(
-                  "flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all",
-                  currentView === 'discovery' ? "bg-zinc-100 text-zinc-950 font-bold shadow-lg shadow-zinc-100/10" : "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900"
-                )}
-              >
-                <LayoutGrid size={16} />
-                <span>Discovery</span>
-              </button>
-              <button 
-                onClick={() => setCurrentView('ide')}
-                className={cn(
-                  "flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all",
-                  currentView === 'ide' ? "bg-zinc-100 text-zinc-950 font-bold shadow-lg shadow-zinc-100/10" : "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900"
-                )}
-              >
-                <Terminal size={16} />
-                <span>API IDE</span>
-              </button>
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col">
+      {/* Top Workspace Header */}
+      <header className="sticky top-0 z-30 border-b border-zinc-800/90 bg-zinc-950/90 backdrop-blur-md">
+        <div className="max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-wrap items-center justify-between gap-3">
+          {/* Brand */}
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl bg-amber-500/15 border border-amber-500/35 flex items-center justify-center shrink-0">
+              <Database size={18} className="text-amber-400" />
             </div>
-          </div>
-
-          {currentView === 'discovery' && (
-            <>
-              <div className="relative group">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500 group-focus-within:text-zinc-300 transition-colors" size={16} />
-                <input
-                  type="text"
-                  placeholder="Search APIs..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full bg-zinc-900 border border-zinc-800 rounded-xl py-2.5 pl-10 pr-4 text-sm text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-zinc-700 transition-all"
-                />
-              </div>
-              <VoiceSearch 
-                onTranscript={(text) => setSearchQuery(text)}
-                className="px-1"
-              />
-
-              <div className="flex flex-col gap-2">
-                <h2 className="text-[10px] text-zinc-600 font-mono uppercase tracking-widest px-3 hidden md:block">Categories</h2>
-                <CategoryScreener 
-                  categories={categories} 
-                  activeCategory={activeCategory} 
-                  onSelect={setActiveCategory} 
-                />
-              </div>
-            </>
-          )}
-        </div>
-
-        <div className="pt-6 border-t border-zinc-800 flex flex-col gap-4">
-          <div className="flex items-center gap-2 text-[10px] text-zinc-500 font-mono uppercase tracking-wider">
-            <Zap size={12} className="text-amber-500" />
-            <span>{initialRegistry.length} APIs Loaded</span>
-          </div>
-          <div className="flex items-center gap-4">
-            <button className="text-zinc-600 hover:text-zinc-400 transition-colors">
-              <Github size={18} />
-            </button>
-            <button className="text-zinc-600 hover:text-zinc-400 transition-colors">
-              <Info size={18} />
-            </button>
-          </div>
-        </div>
-      </aside>
-
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col min-w-0 bg-[radial-gradient(circle_at_top_right,_var(--tw-gradient-stops))] from-zinc-900/50 via-zinc-950 to-zinc-950">
-        {currentView === 'discovery' ? (
-          <>
-            {/* Header */}
-            <header className="h-16 md:h-20 border-b border-zinc-800 px-4 md:px-8 flex items-center justify-between bg-zinc-950/30 backdrop-blur-md sticky top-0 z-10">
-              <div className="flex items-center gap-4">
-                <h2 className="text-sm md:text-xl font-bold text-zinc-100 tracking-tight">
-                  {activeCategory === 'All' ? 'Nexus Discovery' : activeCategory}
-                </h2>
-                <span className="text-[10px] md:text-xs text-zinc-500 bg-zinc-900 px-2 py-1 rounded-md border border-zinc-800">
-                  {filteredAPIs.length} Results
+            <div>
+              <div className="flex items-center gap-2">
+                <h1 className="text-base sm:text-lg font-display font-bold tracking-tight text-zinc-100">
+                  Nexus API IDE
+                </h1>
+                <span className="text-[10px] font-mono uppercase tracking-wider px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-amber-400">
+                  v2.0
                 </span>
               </div>
-
-              <div className="flex items-center bg-zinc-900 p-1 rounded-xl border border-zinc-800">
-                <button
-                  onClick={() => setViewMode('card')}
-                  className={cn(
-                    "flex items-center gap-2 px-2 md:px-4 py-1 md:py-1.5 rounded-lg text-[10px] md:text-xs font-medium transition-all",
-                    viewMode === 'card' ? "bg-zinc-800 text-zinc-100 shadow-sm" : "text-zinc-500 hover:text-zinc-300"
-                  )}
-                >
-                  <LayoutGrid size={12} className="md:w-3.5 md:h-3.5" />
-                  <span className="hidden xs:inline">Card View</span>
-                </button>
-                <button
-                  onClick={() => setViewMode('dev')}
-                  className={cn(
-                    "flex items-center gap-2 px-2 md:px-4 py-1 md:py-1.5 rounded-lg text-[10px] md:text-xs font-medium transition-all",
-                    viewMode === 'dev' ? "bg-zinc-800 text-zinc-100 shadow-sm" : "text-zinc-500 hover:text-zinc-300"
-                  )}
-                >
-                  <Code2 size={12} className="md:w-3.5 md:h-3.5" />
-                  <span className="hidden xs:inline">Developer View</span>
-                </button>
-              </div>
-            </header>
-
-            {/* Grid */}
-            <div className="flex-1 overflow-y-auto p-4 md:p-8 custom-scrollbar">
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-6">
-                <AnimatePresence mode="popLayout">
-                  {filteredAPIs.map((api, index) => (
-                    <motion.div
-                      key={`${api.API}-${api.Link}-${index}`}
-                      layout
-                      initial={{ opacity: 0, y: 20 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, scale: 0.9 }}
-                      transition={{ duration: 0.3, delay: index * 0.05 }}
-                      className="group relative bg-zinc-900/40 border border-zinc-800 hover:border-zinc-700 rounded-2xl p-5 h-[320px] flex flex-col transition-all hover:shadow-2xl hover:shadow-zinc-950/50"
-                    >
-                      <div className="absolute top-0 right-0 p-3 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                      </div>
-                      
-                      <UniversalFetcher 
-                        api={api}
-                        viewMode={viewMode}
-                        onOpenInIde={handleOpenInIde}
-                      />
-                    </motion.div>
-                  ))}
-                </AnimatePresence>
-              </div>
-
-              {filteredAPIs.length === 0 && (
-                <div className="h-full flex flex-col items-center justify-center text-zinc-600 gap-4 py-20">
-                  <Search size={48} strokeWidth={1} />
-                  <div className="text-center">
-                    <p className="text-lg font-medium text-zinc-400">No APIs found</p>
-                    <p className="text-sm">Try adjusting your search or category filters</p>
-                  </div>
-                  <button 
-                    onClick={() => { setSearchQuery(''); setActiveCategory('All'); }}
-                    className="mt-4 px-6 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-100 rounded-xl text-sm transition-colors"
-                  >
-                    Clear all filters
-                  </button>
-                </div>
-              )}
+              <p className="text-[11px] font-mono text-zinc-500 hidden sm:block">
+                Discover, test & chain public APIs directly in your browser
+              </p>
             </div>
-          </>
-        ) : (
-          <ApiIde 
-            initialUrl={ideConfig.url} 
-            initialMethod={ideConfig.method} 
+          </div>
+
+          {/* Primary Navigation */}
+          <nav
+            aria-label="Primary workspace navigation"
+            className="grid grid-cols-3 sm:flex items-center gap-1 p-1 rounded-xl bg-zinc-900 border border-zinc-800 w-full sm:w-auto"
+          >
+            {(
+              [
+                { id: 'ide', label: 'Request IDE', shortLabel: 'IDE', icon: Terminal },
+                { id: 'catalog', label: `Catalog (${initialRegistry.length})`, shortLabel: `Catalog (${initialRegistry.length})`, icon: LayoutGrid },
+                { id: 'workflows', label: 'Workflow Chains', shortLabel: 'Chains', icon: GitBranch },
+              ] as const
+            ).map((item) => {
+              const Icon = item.icon;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setActiveView(item.id)}
+                  className={cn(
+                    'min-h-[38px] px-2 sm:px-4 rounded-lg text-[11px] sm:text-xs font-medium flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap',
+                    activeView === item.id
+                      ? 'bg-zinc-100 text-zinc-950 font-semibold'
+                      : 'text-zinc-400 hover:text-zinc-100',
+                  )}
+                >
+                  <Icon size={13} className="shrink-0" />
+                  <span className="sm:hidden">{item.shortLabel}</span>
+                  <span className="hidden sm:inline">{item.label}</span>
+                </button>
+              );
+            })}
+          </nav>
+
+          {/* Header Utility Links */}
+          <div className="hidden md:flex items-center gap-2">
+            <a
+              href="https://github.com/1nc0gn30/nexus"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="min-h-[38px] px-3 rounded-xl border border-zinc-800 bg-zinc-900/60 hover:border-zinc-700 text-xs text-zinc-300 hover:text-zinc-100 flex items-center gap-1.5 transition-colors"
+            >
+              <Github size={14} />
+              <span>Source</span>
+            </a>
+            <a
+              href={STRIPE_COFFEE_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="min-h-[38px] px-3 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 text-xs font-medium text-amber-300 flex items-center gap-1.5 transition-colors"
+            >
+              <Coffee size={14} />
+              <span>Buy Us a Coffee</span>
+            </a>
+          </div>
+        </div>
+      </header>
+
+      {/* Active Workspace */}
+      <main className="flex-1 flex flex-col">
+        {activeView === 'ide' && (
+          <ApiIde
+            catalog={initialRegistry}
+            method={method}
+            baseUrl={baseUrl}
+            queryParams={queryParams}
+            headers={headers}
+            body={body}
+            onChangeMethod={setMethod}
+            onChangeBaseUrl={setBaseUrl}
+            onChangeQueryParams={setQueryParams}
+            onChangeHeaders={setHeaders}
+            onChangeBody={setBody}
+            collections={collections}
+            onSaveRequest={handleSaveRequest}
+            onDeleteSavedRequest={handleDeleteSavedRequest}
+            onLoadSavedRequest={handleLoadSavedRequest}
+            onExportWorkspace={handleExportWorkspace}
+            onImportWorkspace={handleImportWorkspace}
+            history={history}
+            onPushHistory={(item) => setHistory((prev) => [item, ...prev].slice(0, 25))}
+            onClearHistory={() => setHistory([])}
+          />
+        )}
+
+        {activeView === 'catalog' && (
+          <CatalogView
+            catalog={initialRegistry}
+            onOpenInIde={handleOpenInIde}
+            onAddToWorkflow={handleAddToWorkflow}
+          />
+        )}
+
+        {activeView === 'workflows' && (
+          <WorkflowBuilder
+            workflows={workflows}
+            onChangeWorkflows={setWorkflows}
+            onExportWorkspace={handleExportWorkspace}
           />
         )}
       </main>
+
+      {/* Open-Access Attribution & Support Footer */}
+      <footer className="border-t border-zinc-800/80 bg-zinc-950/90 mt-8">
+        <div className="max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 py-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 text-xs text-zinc-400">
+          <div className="space-y-1">
+            <p className="text-zinc-300 font-medium">
+              Engineered by{' '}
+              <a
+                href="https://nullai.tech"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-zinc-100 hover:text-amber-400 underline underline-offset-4"
+              >
+                Neal Frazier Tech (@1nc0gn30)
+              </a>{' '}
+              •{' '}
+              <a
+                href="https://nullai.tech"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="hover:text-amber-400"
+              >
+                NullAI Platform
+              </a>
+            </p>
+            <p className="text-[11px] font-mono text-zinc-500">
+              100% open-access developer tool · zero paywalls ·{' '}
+              <a
+                href="https://github.com/1nc0gn30/nexus"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-zinc-400 hover:text-zinc-200 underline underline-offset-2"
+              >
+                github.com/1nc0gn30/nexus
+              </a>
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <a
+              href={STRIPE_COFFEE_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="min-h-[38px] px-3.5 rounded-xl border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 font-medium flex items-center gap-1.5 transition-colors"
+            >
+              <Coffee size={13} />
+              <span>Buy Us a Coffee</span>
+            </a>
+
+            <button
+              type="button"
+              onClick={handleCopySolana}
+              title={`Copy Solana tip address: ${SOLANA_TIP_ADDRESS}`}
+              className="min-h-[38px] px-3 rounded-xl border border-zinc-800 bg-zinc-900 hover:border-zinc-700 text-zinc-300 font-mono text-[11px] flex items-center gap-1.5 transition-colors"
+            >
+              <span>SOL: {SOLANA_TIP_ADDRESS.slice(0, 6)}…{SOLANA_TIP_ADDRESS.slice(-4)}</span>
+              {copiedSolana ? (
+                <Check size={12} className="text-emerald-400" />
+              ) : (
+                <Copy size={12} className="text-zinc-500" />
+              )}
+            </button>
+          </div>
+        </div>
+      </footer>
     </div>
   );
 }
